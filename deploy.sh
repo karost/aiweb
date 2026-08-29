@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Deploy AI Web into Hermes: plugin + skill (symlinks).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -9,6 +8,14 @@ PLUGIN_SRC="$ROOT/plugins"
 SKILL_SRC="$ROOT/skills/aiweb-memory"
 PLUGIN_DST="$HERMES_HOME/plugins/aiweb"
 SKILL_DST="$HERMES_HOME/skills/aiweb-memory"
+
+# Fix nested plugins/plugins → plugins/
+if [[ -f "$PLUGIN_SRC/plugins/plugin.yaml" ]]; then
+  shopt -s dotglob nullglob
+  mv "$PLUGIN_SRC/plugins"/* "$PLUGIN_SRC"/
+  rm -rf "$PLUGIN_SRC/plugins"
+  shopt -u dotglob nullglob
+fi
 
 if [[ ! -f "$PLUGIN_SRC/plugin.yaml" ]]; then
   echo "error: missing $PLUGIN_SRC/plugin.yaml" >&2
