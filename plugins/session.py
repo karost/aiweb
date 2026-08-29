@@ -1,8 +1,4 @@
-"""AI Web — session state machine helpers (daemon-side).
-
-States: DaemonDown | BrowserDown | Ready | Busy | NeedsLogin
-BrowserEngine is attached by the daemon; this module tracks flags only.
-"""
+"""AI Web V3 — session state (daemon-side). Tracks conversation URL for continuity."""
 
 from __future__ import annotations
 
@@ -17,68 +13,52 @@ from . import memory_manager as mem
 
 
 class SessionState(str, Enum):
-    DAEMON_DOWN = "DaemonDown"   # client-side only normally
     BROWSER_DOWN = "BrowserDown"
     READY = "Ready"
     BUSY = "Busy"
     NEEDS_LOGIN = "NeedsLogin"
 
 
-HEAVY_OPS = frozenset({"aiweb", "chat", "write", "login"})
-CONTROL_OPS = frozenset({"status", "more", "clear_model", "keep_model", "hello"})
-STOP_OPS = frozenset({"stop"})
+HEAVY_OPS = frozenset({"aiweb", "chat", "write", "login", "run", "load", "new"})
+CONTROL_OPS = frozenset({"status", "more", "clear_model", "keep_model", "hello", "reset_memory", "summary", "stop"})
 
 
 @dataclass
 class SessionStatus:
     state: SessionState = SessionState.BROWSER_DOWN
     browser_up: bool = False
-    daemon_up: bool = True
     page_url: Optional[str] = None
+    conversation_url: Optional[str] = None  # key for same-chat continuity
     login_required: bool = False
     last_op_ok: Optional[bool] = None
     last_error: Optional[str] = None
     last_gen_id: Optional[str] = None
     busy: bool = False
     daemon_pid: Optional[int] = None
-    protocol_version: int = 1
     updated_at: float = field(default_factory=time.time)
 
     def session_alive(self) -> bool:
-        return bool(
-            self.daemon_up
-            and self.browser_up
-            and self.state
-            in (SessionState.READY, SessionState.BUSY, SessionState.NEEDS_LOGIN)
-        )
+        return bool(self.browser_up and self.state in (SessionState.READY, SessionState.BUSY, SessionState.NEEDS_LOGIN))
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
-            "daemon_up": self.daemon_up,
             "browser_up": self.browser_up,
             "state": self.state.value,
             "page_url": self.page_url,
+            "conversation_url": self.conversation_url,
             "login_required": self.login_required or self.state == SessionState.NEEDS_LOGIN,
             "session_alive": self.session_alive(),
             "busy": self.busy or self.state == SessionState.BUSY,
             "inject_pending": mem.inject_pending(),
             "last_gen_id": self.last_gen_id,
-            "last_op_ok": self.last_op_ok,
-            "last_error": self.last_error,
             "daemon_pid": self.daemon_pid or os.getpid(),
-            "protocol_version": self.protocol_version,
         }
 
 
 class SessionManager:
-    """
-    In-daemon singleton-style manager.
-    Does not launch Playwright itself — holds engine reference set by daemon/service.
-    """
-
     def __init__(self) -> None:
         self.status = SessionStatus()
-        self.engine: Any = None  # BrowserEngine | None
+        self.engine: Any = None
         self._heavy_lock = False
 
     def bind_engine(self, engine: Any) -> None:
@@ -93,17 +73,20 @@ class SessionManager:
         self.status.browser_up = False
         self.status.state = SessionState.BROWSER_DOWN
         self.status.page_url = None
+        self.status.conversation_url = None
         self.status.busy = False
         self._heavy_lock = False
         self._touch()
 
-    def mark_ready(self, *, page_url: Optional[str] = None) -> None:
+    def mark_ready(self, *, page_url: Optional[str] = None, conversation_url: Optional[str] = None) -> None:
         self.status.browser_up = True
         self.status.state = SessionState.READY
         self.status.busy = False
         self._heavy_lock = False
         if page_url is not None:
             self.status.page_url = page_url
+        if conversation_url is not None:
+            self.status.conversation_url = conversation_url
         self.status.login_required = False
         self._touch()
 
@@ -118,7 +101,6 @@ class SessionManager:
         self._touch()
 
     def try_begin_heavy(self) -> bool:
-        """Return False if another heavy op holds the session."""
         if self._heavy_lock or self.status.state == SessionState.BUSY:
             return False
         self._heavy_lock = True
@@ -133,17 +115,13 @@ class SessionManager:
         self.status.last_op_ok = ok
         self.status.last_error = error
         if self.status.browser_up:
-            if self.status.login_required:
-                self.status.state = SessionState.NEEDS_LOGIN
-            else:
-                self.status.state = SessionState.READY
+            self.status.state = SessionState.NEEDS_LOGIN if self.status.login_required else SessionState.READY
         else:
             self.status.state = SessionState.BROWSER_DOWN
         self._touch()
 
     def can_run(self, op: str) -> tuple[bool, Optional[str]]:
-        """Concurrency matrix: heavy blocked when busy; control/stop allowed."""
-        if op in CONTROL_OPS or op in STOP_OPS:
+        if op in CONTROL_OPS:
             return True, None
         if op in HEAVY_OPS:
             if self._heavy_lock or self.status.state == SessionState.BUSY:
@@ -155,21 +133,20 @@ class SessionManager:
         self.status.last_gen_id = gen_id
         self._touch()
 
-    def persist_state_file(self) -> None:
-        path = mem.data_dir() / "state.json"
-        payload = self.status.to_public_dict()
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    def set_conversation_url(self, url: Optional[str]) -> None:
+        self.status.conversation_url = url
+        self._touch()
 
     def _touch(self) -> None:
         self.status.updated_at = time.time()
         self.status.daemon_pid = os.getpid()
         try:
-            self.persist_state_file()
+            path = mem.data_dir() / "state.json"
+            path.write_text(json.dumps(self.status.to_public_dict(), indent=2), encoding="utf-8")
         except OSError:
             pass
 
 
-# Module-level instance used by service/daemon in-process
 _SESSION: Optional[SessionManager] = None
 
 
@@ -180,18 +157,4 @@ def get_session() -> SessionManager:
     return _SESSION
 
 
-def reset_session_for_tests() -> None:
-    global _SESSION
-    _SESSION = SessionManager()
-
-
-__all__ = [
-    "SessionState",
-    "SessionStatus",
-    "SessionManager",
-    "HEAVY_OPS",
-    "CONTROL_OPS",
-    "STOP_OPS",
-    "get_session",
-    "reset_session_for_tests",
-]
+__all__ = ["SessionState", "SessionStatus", "SessionManager", "get_session", "HEAVY_OPS", "CONTROL_OPS"]

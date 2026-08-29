@@ -1,7 +1,4 @@
-"""AI Web — thin slash command handlers (CLI + TUI).
-
-All handlers call client.request; no Playwright here.
-"""
+"""AI Web V3 — thin slash command handlers. All work goes through client.request."""
 
 from __future__ import annotations
 
@@ -12,10 +9,6 @@ from .client import format_user_message, request
 
 
 def _parse_write_args(raw: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    /aiweb-write <path> <prompt...>
-    path is first token; rest is prompt.
-    """
     raw = (raw or "").strip()
     if not raw:
         return None, None
@@ -34,73 +27,81 @@ def _parse_write_args(raw: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def cmd_aiweb(arg: str = "") -> str:
-    """Research on Grok; final-only inject on next Hermes model turn."""
     msg = (arg or "").strip()
     if not msg:
         return "Usage: /aiweb <prompt>"
-    result = request("aiweb", message=msg)
-    return format_user_message(result)
+    return format_user_message(request("aiweb", message=msg))
 
 
 def cmd_aiweb_chat(arg: str = "") -> str:
-    """Research on Grok; no model inject."""
     msg = (arg or "").strip()
     if not msg:
         return "Usage: /aiweb-chat <prompt>"
-    result = request("chat", message=msg)
-    return format_user_message(result)
+    return format_user_message(request("chat", message=msg))
+
+
+def cmd_aiweb_new(arg: str = "") -> str:
+    """Only command that starts a fresh Grok conversation."""
+    extra = (arg or "").strip()
+    return format_user_message(request("new", message=extra))
 
 
 def cmd_aiweb_write(arg: str = "") -> str:
-    """Grok → file under out dir."""
     path, prompt = _parse_write_args(arg)
     if not path or not prompt:
         return "Usage: /aiweb-write <path> <prompt>"
-    result = request("write", path=path, prompt=prompt)
-    return format_user_message(result)
+    return format_user_message(request("write", path=path, prompt=prompt))
 
 
 def cmd_aiweb_more(arg: str = "") -> str:
-    """Next chunk of last large response."""
-    result = request("more")
-    return format_user_message(result)
+    return format_user_message(request("more"))
 
 
 def cmd_aiweb_login(arg: str = "") -> str:
-    """Headed login / refresh session."""
-    result = request("login")
-    return format_user_message(result)
+    return format_user_message(request("login"))
 
 
 def cmd_aiweb_stop(arg: str = "") -> str:
-    """
-    Close browser. Optional: /aiweb-stop daemon  → stop daemon process too.
-    """
     raw = (arg or "").strip().lower()
     stop_daemon = raw in ("daemon", "--daemon", "all")
-    result = request("stop", daemon=stop_daemon, stop_daemon=stop_daemon)
-    return format_user_message(result)
+    return format_user_message(request("stop", daemon=stop_daemon, stop_daemon=stop_daemon))
 
 
 def cmd_aiweb_status(arg: str = "") -> str:
-    result = request("status")
-    return format_user_message(result)
+    return format_user_message(request("status"))
 
 
 def cmd_aiweb_clear_model(arg: str = "") -> str:
-    result = request("clear_model")
-    return format_user_message(result)
+    return format_user_message(request("clear_model"))
 
 
 def cmd_aiweb_keep_model(arg: str = "") -> str:
-    result = request("keep_model")
-    return format_user_message(result)
+    return format_user_message(request("keep_model"))
 
 
-# Map for __init__.py registration
+def cmd_aiweb_run(arg: str = "") -> str:
+    msg = (arg or "").strip()
+    if not msg:
+        return "Usage: /aiweb-run <prompt>"
+    return format_user_message(request("run", message=msg))
+
+
+def cmd_aiweb_load(arg: str = "") -> str:
+    return format_user_message(request("load", message=(arg or "").strip()))
+
+
+def cmd_aiweb_reset(arg: str = "") -> str:
+    return format_user_message(request("reset_memory"))
+
+
+def cmd_aiweb_summary(arg: str = "") -> str:
+    return format_user_message(request("summary", message=(arg or "").strip()))
+
+
 COMMAND_HANDLERS = {
     "aiweb": cmd_aiweb,
     "aiweb-chat": cmd_aiweb_chat,
+    "aiweb-new": cmd_aiweb_new,
     "aiweb-write": cmd_aiweb_write,
     "aiweb-more": cmd_aiweb_more,
     "aiweb-login": cmd_aiweb_login,
@@ -108,6 +109,10 @@ COMMAND_HANDLERS = {
     "aiweb-status": cmd_aiweb_status,
     "aiweb-clear-model": cmd_aiweb_clear_model,
     "aiweb-keep-model": cmd_aiweb_keep_model,
+    "aiweb-run": cmd_aiweb_run,
+    "aiweb-load": cmd_aiweb_load,
+    "aiweb-reset": cmd_aiweb_reset,
+    "aiweb-summary": cmd_aiweb_summary,
 }
 
 
@@ -117,20 +122,8 @@ def dispatch(name: str, arg: str = "") -> str:
         return f"Unknown AI Web command: {name}"
     try:
         return fn(arg)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return f"❌ AI Web command error: {e}"
 
 
-__all__ = [
-    "COMMAND_HANDLERS",
-    "dispatch",
-    "cmd_aiweb",
-    "cmd_aiweb_chat",
-    "cmd_aiweb_write",
-    "cmd_aiweb_more",
-    "cmd_aiweb_login",
-    "cmd_aiweb_stop",
-    "cmd_aiweb_status",
-    "cmd_aiweb_clear_model",
-    "cmd_aiweb_keep_model",
-]
+__all__ = ["COMMAND_HANDLERS", "dispatch"]

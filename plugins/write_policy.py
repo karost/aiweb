@@ -1,4 +1,4 @@
-"""AI Web — safe write path resolution and atomic file writes.
+"""AI Web V3 — safe write path resolution and atomic file writes.
 
 Jail: all outputs under OUT_DIR (realpath). Reject .., absolute escapes,
 and sensitive filenames.
@@ -89,7 +89,6 @@ def resolve_out_path(
             f"sensitive name rejected: {Path(raw).name}",
         )
 
-    # Disallow home/env expansion tricks in segments
     p = Path(raw)
     if any(part == ".." for part in p.parts):
         return WriteResolveErr("write_rejected", "path traversal (..) not allowed")
@@ -124,6 +123,7 @@ def extract_primary_code(
     """
     Extract primary fenced code body.
     Returns (body_or_None, reason_if_none).
+    Fail-closed: no fence → refuse to dump whole prose as "code".
     """
     raw = (text or "").strip()
     if not raw:
@@ -137,12 +137,10 @@ def extract_primary_code(
             blocks.append((lang, body))
 
     if not blocks:
-        # Fail closed for write: do not dump whole prose as "code"
         return None, "no fenced code block found"
 
     lang_pref = (language or "").strip().lower()
     if not lang_pref:
-        # Infer from common extensions handled by caller; no pref → largest
         body = max(blocks, key=lambda lb: len(lb[1]))[1]
         return body, "ok"
 
@@ -151,7 +149,7 @@ def extract_primary_code(
         body = max(preferred, key=lambda lb: len(lb[1]))[1]
         return body, "ok"
 
-    # Fallback largest any fence
+    # Fallback: largest any fence
     body = max(blocks, key=lambda lb: len(lb[1]))[1]
     return body, "ok"
 
@@ -216,12 +214,33 @@ def looks_like_chrome(text: str) -> bool:
         return True
     chrome_hits = sum(
         1
-        for k in ("sign in", "log in", "cookie", "accept all", "nav ", "skip to content")
+        for k in (
+            "sign in",
+            "log in",
+            "cookie",
+            "accept all",
+            "nav ",
+            "skip to content",
+            "continue with x",
+            "continue with twitter",
+        )
         if k in t
     )
     if chrome_hits >= 2 and len(t) < 400:
         return True
     return False
+
+
+def write_inject_mode() -> str:
+    """
+    HERMES_AIWEB_WRITE_INJECT:
+      none      → no model inject after write (default)
+      path_only → inject only the written path
+    """
+    v = (os.environ.get("HERMES_AIWEB_WRITE_INJECT") or "none").strip().lower()
+    if v in {"path_only", "path", "file"}:
+        return "path_only"
+    return "none"
 
 
 __all__ = [
@@ -235,4 +254,5 @@ __all__ = [
     "atomic_write",
     "looks_like_chrome",
     "is_sensitive_name",
+    "write_inject_mode",
 ]

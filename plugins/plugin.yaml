@@ -1,73 +1,72 @@
-# AI Web — Hermes plugin metadata
-# Architecture v2: session daemon + client, TUI-safe keep-alive,
-# final-only inject, smart size pipeline.
+# AI Web V3 — Hermes plugin metadata
+# One warm headed persistent context (V1-style anti-block) + daemon (TUI-safe) + same-chat continuity.
 
 name: aiweb
-version: "2.0.0"
+version: "3.0.0"
 description: >
-  Grok via real Chrome (Playwright/CDP) with a session daemon for
-  hermes --tui and CLI. Keep-alive browser, large-answer disk+chunk,
-  final-only model inject, and safe /aiweb-write.
+  Grok via real Chrome owned by a long-lived session daemon.
+  Keep-alive browser, same-conversation continuity, final-only model inject,
+  large-answer disk+chunk, safe /aiweb-write. TUI and CLI safe.
 
-# Optional metadata (Hermes may ignore unknown keys)
 author: local
 protocol_version: 1
-
 entry: __init__.py
 
-# Env knobs (documented; read by client/daemon/service)
 config:
   RESPONSE_DEFAULT_SIZE:
     env: HERMES_AIWEB_RESPONSE_DEFAULT_SIZE
-    default: 2000
-    description: Max chars for "small" path (no chat chunking)
+    default: 2500
   MODEL_PACK_CAP:
     env: HERMES_AIWEB_MODEL_PACK
     default: 6000
-    description: Max chars injected into Hermes model context
-  MAX_CAPTURE_CHARS:
-    env: HERMES_AIWEB_MAX_CAPTURE_CHARS
-    default: 500000
   TIMEOUT:
     env: HERMES_AIWEB_TIMEOUT
     default: 300
-  IDLE_SEC:
-    env: HERMES_AIWEB_IDLE_SEC
-    default: 1800
-  OUT_DIR:
-    env: HERMES_AIWEB_OUT_DIR
-    default: ""   # empty → $HERMES_HOME/data/aiweb/out
   KEEP_ALIVE:
     env: HERMES_AIWEB_KEEP_ALIVE
     default: "1"
+  HEADED:
+    env: HERMES_AIWEB_HEADED
+    default: "1"
+  OUT_DIR:
+    env: HERMES_AIWEB_OUT_DIR
+    default: ""
   WRITE_INJECT:
     env: HERMES_AIWEB_WRITE_INJECT
-    default: "none"   # none | path_only
-  KEEP_ALIVE_BROWSER:
-    env: HERMES_AIWEB_KEEP_ALIVE
-    default: "1"
+    default: "none"
 
 commands:
   - name: aiweb
-    description: Grok research; final-only inject on next Hermes turn
+    description: Grok research in current conversation; final-only inject on next Hermes turn
   - name: aiweb-chat
-    description: Grok research; no model inject
+    description: Grok research in current conversation; no model inject
+  - name: aiweb-new
+    description: Start a fresh Grok conversation (only command that opens new chat)
   - name: aiweb-write
-    description: Grok → file under out dir (no full-body inject)
+    description: Grok → file under out dir
   - name: aiweb-more
     description: Next chunk of last large response
   - name: aiweb-login
-    description: Headed login / refresh session
+    description: Headed login; browser stays open
   - name: aiweb-stop
-    description: Close browser session (optional --daemon)
+    description: Close browser (optional daemon)
   - name: aiweb-status
-    description: Daemon/browser/inject pending status
+    description: Daemon / browser / conversation / inject status
   - name: aiweb-clear-model
     description: Clear inject buffer and sticky flag
   - name: aiweb-keep-model
-    description: Make inject sticky until clear (still capped)
+    description: Make inject sticky until clear
+  - name: aiweb-run
+    description: Ask Grok for runnable Python (no local exec)
+  - name: aiweb-load
+    description: Inject hot memory into the CURRENT conversation
+  - name: aiweb-reset
+    description: Reset hot/archive memory and inject buffer
+  - name: aiweb-summary
+    description: Append a short memory summary
 
 notes:
-  - Browser is owned by the AI Web daemon, not the TUI slash worker.
-  - Inject applies on the next agent LLM call (pre_llm_call), not inside slash.
+  - Browser is owned by the AI Web daemon only.
+  - Same-chat by default. Only /aiweb-new starts a new conversation.
+  - Inject applies on the next agent LLM call (pre_llm_call).
   - Automating Grok/x.com may violate ToS — personal use at your own risk.

@@ -1,12 +1,6 @@
-"""AI Web — session daemon (owns Playwright + service.handle).
+"""AI Web V3 — session daemon (owns Playwright + service.handle).
 
-Listen on $HERMES_HOME/data/aiweb/daemon.sock (JSON-lines).
-Protocol: handshake op=hello with protocol_version; then work ops.
-
-Run:
-  python -m aiweb.daemon
-or:
-  python /path/to/plugins/aiweb/daemon.py
+Long-lived process. Browser is started once and kept warm.
 """
 
 from __future__ import annotations
@@ -22,19 +16,17 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
-# Allow running as script: ensure plugin root on path
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT.parent))
 
-from aiweb import memory_manager as mem  # type: ignore
-from aiweb.service import PROTOCOL_VERSION, handle  # type: ignore
-from aiweb.session import get_session  # type: ignore
+from aiweb import memory_manager as mem
+from aiweb.service import PROTOCOL_VERSION, handle
+from aiweb.session import get_session
 
-DAEMON_VERSION = "2.0.0"
+DAEMON_VERSION = "3.0.0"
 SOCK_NAME = "daemon.sock"
 PID_NAME = "daemon.pid"
-LOCK_NAME = "daemon.lock"
 
 _stop_flag = threading.Event()
 _exit_after_stop = False
@@ -50,10 +42,6 @@ def _sock_path() -> Path:
 
 def _pid_path() -> Path:
     return _data() / PID_NAME
-
-
-def _lock_path() -> Path:
-    return _data() / LOCK_NAME
 
 
 def _write_pid() -> None:
@@ -86,13 +74,11 @@ def _pid_alive(pid: int) -> bool:
 
 
 def acquire_singleton() -> None:
-    """Fail if another live daemon holds the pid."""
     _data().mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(_data(), 0o700)
     except OSError:
         pass
-
     pid_file = _pid_path()
     if pid_file.exists():
         try:
@@ -100,10 +86,7 @@ def acquire_singleton() -> None:
         except ValueError:
             old = -1
         if _pid_alive(old) and old != os.getpid():
-            raise SystemExit(
-                f"AI Web daemon already running (pid={old}). "
-                f"Use /aiweb-status or stop that process."
-            )
+            raise SystemExit(f"AI Web daemon already running (pid={old}).")
         try:
             pid_file.unlink()
         except OSError:
@@ -114,7 +97,6 @@ def acquire_singleton() -> None:
                 sock.unlink()
             except OSError:
                 pass
-
     _write_pid()
 
 
@@ -162,60 +144,23 @@ def _handle_connection(conn: socket.socket) -> None:
             if op == "hello":
                 client_proto = int(args.get("protocol_version") or req.get("protocol_version") or 1)
                 if client_proto != PROTOCOL_VERSION:
-                    _send(
-                        conn,
-                        {
-                            "id": req_id,
-                            "ok": False,
-                            "error": "protocol mismatch",
-                            "error_code": "protocol_mismatch",
-                            "protocol_version": PROTOCOL_VERSION,
-                            "daemon_version": DAEMON_VERSION,
-                            "min_protocol": PROTOCOL_VERSION,
-                        },
-                    )
+                    _send(conn, {
+                        "id": req_id, "ok": False, "error": "protocol mismatch",
+                        "error_code": "protocol_mismatch", "protocol_version": PROTOCOL_VERSION,
+                    })
                     continue
-                _send(
-                    conn,
-                    {
-                        "id": req_id,
-                        "ok": True,
-                        "protocol_version": PROTOCOL_VERSION,
-                        "daemon_version": DAEMON_VERSION,
-                        "min_protocol": PROTOCOL_VERSION,
-                        "message": "hello",
-                    },
-                )
+                _send(conn, {
+                    "id": req_id, "ok": True, "protocol_version": PROTOCOL_VERSION,
+                    "daemon_version": DAEMON_VERSION, "message": "hello",
+                })
                 continue
 
             try:
                 result = handle(op, request_id=request_id, **args)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 result = {
-                    "ok": False,
-                    "message": f"internal: {e}",
-                    "request_id": request_id or req_id,
-                    "session_alive": False,
-                    "state": "BrowserDown",
-                    "busy": False,
-                    "error": str(e),
-                    "error_code": "internal",
-                    "artifacts": [],
-                    "op": op,
-                    "inject": {
-                        "written": False,
-                        "pending": False,
-                        "chars": 0,
-                        "mode": "none",
-                        "distill_method": None,
-                        "capped": False,
-                        "cap": None,
-                    },
-                    "path": "none",
-                    "chars": 0,
-                    "full_path": None,
-                    "gen_id": None,
-                    "more_available": False,
+                    "ok": False, "message": f"internal: {e}", "request_id": request_id,
+                    "error": str(e), "error_code": "internal", "op": op,
                 }
                 traceback.print_exc()
 
@@ -223,47 +168,21 @@ def _handle_connection(conn: socket.socket) -> None:
             result["id"] = req_id
             _send(conn, result)
 
-            # stop --daemon
-            if op == "stop" and (
-                args.get("daemon") or args.get("stop_daemon")
-            ):
+            if op == "stop" and (args.get("daemon") or args.get("stop_daemon")):
                 _exit_after_stop = True
                 _stop_flag.set()
                 break
+    except Exception:
+        traceback.print_exc()
     finally:
         try:
             conn.close()
-        except OSError:
+        except Exception:
             pass
-
-
-def _accept_loop(server: socket.socket) -> None:
-    server.settimeout(1.0)
-    while not _stop_flag.is_set():
-        try:
-            conn, _ = server.accept()
-        except socket.timeout:
-            continue
-        except OSError:
-            if _stop_flag.is_set():
-                break
-            continue
-        try:
-            os.chmod(_sock_path(), 0o600)
-        except OSError:
-            pass
-        t = threading.Thread(target=_handle_connection, args=(conn,), daemon=True)
-        t.start()
 
 
 def main() -> None:
-    global _exit_after_stop
     acquire_singleton()
-    sess = get_session()
-    sess.status.daemon_up = True
-    sess.status.daemon_pid = os.getpid()
-    sess.persist_state_file()
-
     sock_path = _sock_path()
     if sock_path.exists():
         try:
@@ -273,49 +192,42 @@ def main() -> None:
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
-    try:
-        os.chmod(sock_path, 0o600)
-    except OSError:
-        pass
     server.listen(8)
+    server.settimeout(1.0)
 
     def _sig(_signum, _frame):
         _stop_flag.set()
 
-    signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
 
-    print(f"[aiweb-daemon] pid={os.getpid()} sock={sock_path}", flush=True)
+    print(f"[aiweb-daemon] v{DAEMON_VERSION} listening on {sock_path}", flush=True)
 
     try:
-        _accept_loop(server)
+        while not _stop_flag.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            t = threading.Thread(target=_handle_connection, args=(conn,), daemon=True)
+            t.start()
     finally:
         try:
             server.close()
-        except OSError:
-            pass
-        # Close browser if any
-        try:
-            eng = get_session().engine
-            if eng is not None:
-                from aiweb.browser_engine import run_async
-
-                run_async(eng.stop())
         except Exception:
             pass
-        get_session().mark_browser_down()
         _remove_pid()
-        print("[aiweb-daemon] exit", flush=True)
+        if _exit_after_stop:
+            try:
+                from aiweb.session import get_session
+                from aiweb.browser_engine import run_async
+                sess = get_session()
+                if sess.engine is not None:
+                    run_async(sess.engine.stop())
+            except Exception:
+                pass
+        print("[aiweb-daemon] exited", flush=True)
 
 
 if __name__ == "__main__":
-    # When executed as file, package import is aiweb.* only if parent on path
-    # Re-map: running as script from plugins/aiweb/daemon.py
-    if __package__ is None or __package__ == "":
-        # parent of aiweb package dir is plugins/
-        plugins = _PLUGIN_ROOT.parent
-        if str(plugins) not in sys.path:
-            sys.path.insert(0, str(plugins))
-        # package name folder must be aiweb — this file lives IN aiweb/
-        pass
     main()

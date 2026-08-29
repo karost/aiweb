@@ -1,4 +1,4 @@
-"""AI Web — failure artifacts (screenshots, HTML, text dumps)."""
+"""AI Web V3 — failure artifacts (screenshots, HTML, text dumps) + debug logs."""
 
 from __future__ import annotations
 
@@ -71,8 +71,14 @@ async def capture_page_artifacts(
     note: str = "",
     extra_text: str = "",
 ) -> list[str]:
+    """
+    Capture HTML + full-page screenshot + metadata for a failure or diagnostic.
+    Returns list of artifact paths (including the failure directory itself).
+    Safe to call even if page is partially dead.
+    """
     paths: list[str] = []
     out = new_failure_dir(op=op, request_id=request_id)
+
     if note:
         write_text_artifact(out, "note.txt", note)
     if extra_text:
@@ -81,21 +87,25 @@ async def capture_page_artifacts(
     try:
         html = await page.content()
         paths.append(str(write_text_artifact(out, "page.html", html)))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         write_text_artifact(out, "html_error.txt", repr(e))
 
     try:
         png = await page.screenshot(full_page=True)
         paths.append(str(write_bytes_artifact(out, "screenshot.png", png)))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         write_text_artifact(out, "screenshot_error.txt", repr(e))
 
     try:
-        write_text_artifact(out, "url.txt", page.url or "")
+        write_text_artifact(out, "url.txt", getattr(page, "url", "") or "")
     except Exception:
         pass
 
-    write_text_artifact(out, "meta.txt", f"op={op}\nrequest_id={request_id}\n")
+    write_text_artifact(
+        out,
+        "meta.txt",
+        f"op={op}\nrequest_id={request_id}\nts={datetime.now(timezone.utc).isoformat()}\n",
+    )
     paths.append(str(out))
     return paths
 
@@ -107,6 +117,7 @@ def capture_text_failure(
     note: str,
     body: str = "",
 ) -> list[str]:
+    """Text-only failure (no live page). Useful when capture already failed."""
     out = new_failure_dir(op=op, request_id=request_id)
     paths = [str(write_text_artifact(out, "note.txt", note))]
     if body:
@@ -117,6 +128,7 @@ def capture_text_failure(
 
 
 def append_debug_log(request_id: str, line: str) -> Path:
+    """Append one line to a per-request debug log under debug_logs/."""
     p = debug_logs_root() / f"{_safe_slug(request_id, 64)}.log"
     with p.open("a", encoding="utf-8") as f:
         f.write(line.rstrip() + "\n")
