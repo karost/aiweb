@@ -58,35 +58,52 @@ def _plugin_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _spawn_daemon() -> None:
-    """Start daemon as detached subprocess using same Python."""
-    mem.data_dir().mkdir(parents=True, exist_ok=True)
-    plugins_dir = _plugin_root().parent  # .../plugins
-    env = os.environ.copy()
-    env.setdefault("HERMES_HOME", str(mem.data_dir().parent.parent))
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
 
-    # Prefer: python -m aiweb.daemon with plugins on PYTHONPATH
-    cmd = [sys.executable, "-m", "aiweb.daemon"]
-    try:
-        subprocess.Popen(
-            cmd,
-            cwd=str(plugins_dir),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError:
-        # Fallback: run daemon.py as file
-        daemon_py = _plugin_root() / "daemon.py"
-        subprocess.Popen(
-            [sys.executable, str(daemon_py)],
-            cwd=str(plugins_dir),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+
+def _hermes_plugins_dir() -> Path:
+    """Directory that contains the package name 'aiweb' (symlink)."""
+    return _hermes_home() / "plugins"
+
+
+def _daemon_python() -> str:
+    """Prefer Hermes venv Python so Playwright resolves correctly."""
+    env = (os.environ.get("HERMES_AIWEB_PYTHON") or "").strip()
+    if env and Path(env).is_file():
+        return env
+    candidate = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+    if candidate.is_file():
+        return str(candidate)
+    return sys.executable
+
+
+def _spawn_daemon() -> None:
+    """Start daemon detached: python -m aiweb.daemon with cwd=$HERMES_HOME/plugins."""
+    mem.data_dir().mkdir(parents=True, exist_ok=True)
+    plugins_dir = _hermes_plugins_dir()
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(_hermes_home())
+
+    py = _daemon_python()
+    cmd = [py, "-m", "aiweb.daemon"]
+
+    err_path = mem.data_dir() / "daemon_spawn.err"
+    err_f = open(err_path, "a", encoding="utf-8")
+    err_f.write(
+        f"\n--- spawn {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"cmd={cmd!r} cwd={str(plugins_dir)!r} py={py!r}\n"
+    )
+    err_f.flush()
+
+    subprocess.Popen(
+        cmd,
+        cwd=str(plugins_dir),
+        env=env,
+        stdout=err_f,
+        stderr=err_f,
+        start_new_session=True,
+    )
 
 
 def _connect() -> socket.socket:
@@ -101,7 +118,7 @@ def _recv_json(sock: socket.socket) -> dict[str, Any]:
     buf = bytearray()
     while True:
         if b"\n" in buf:
-            line, _, rest = buf.partition(b"\n")
+            line, _, _rest = buf.partition(b"\n")
             return json.loads(line.decode("utf-8"))
         chunk = sock.recv(65536)
         if not chunk:
@@ -164,7 +181,6 @@ def ensure_daemon() -> None:
     if daemon_is_live():
         return
 
-    # Stale pid/sock cleanup
     pid = _read_pid()
     if pid is not None and not _pid_alive(pid):
         for p in (_pid_path(), _sock_path()):
@@ -176,7 +192,7 @@ def ensure_daemon() -> None:
 
     _spawn_daemon()
     deadline = time.time() + SPAWN_WAIT_SEC
-    last_err = "timeout"
+    last_err = "timeout waiting for daemon"
     while time.time() < deadline:
         time.sleep(0.25)
         try:
@@ -184,11 +200,17 @@ def ensure_daemon() -> None:
                 return
         except Exception as e:  # noqa: BLE001
             last_err = str(e)
+
+    err_file = mem.data_dir() / "daemon_spawn.err"
+    extra = ""
+    if err_file.exists():
+        try:
+            extra = "\n" + err_file.read_text(encoding="utf-8")[-2000:]
+        except OSError:
+            pass
     raise RuntimeError(
         "spawn_failed: could not start AI Web daemon. "
-        f"Last error: {last_err}. "
-        "Check: pip install playwright && playwright install chromium; "
-        f"data dir={mem.data_dir()}"
+        f"{last_err}. Check {err_file}.{extra}"
     )
 
 
@@ -220,8 +242,7 @@ def request(op: str, **args: Any) -> dict[str, Any]:
 
     try:
         return _once()
-    except (ConnectionError, OSError, socket.error) as e:
-        # One retry after forced respawn
+    except (ConnectionError, OSError, socket.error):
         for p in (_pid_path(), _sock_path()):
             if p.exists():
                 try:
@@ -257,6 +278,33 @@ def request(op: str, **args: Any) -> dict[str, Any]:
                 },
                 "op": op,
             }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "message": f"spawn_failed / client error: {e}",
+            "request_id": request_id,
+            "session_alive": False,
+            "state": "DaemonDown",
+            "busy": False,
+            "error": str(e),
+            "error_code": "spawn_failed",
+            "artifacts": [],
+            "path": "none",
+            "chars": 0,
+            "full_path": None,
+            "gen_id": None,
+            "more_available": False,
+            "inject": {
+                "written": False,
+                "pending": False,
+                "chars": 0,
+                "mode": "none",
+                "distill_method": None,
+                "capped": False,
+                "cap": None,
+            },
+            "op": op,
+        }
 
 
 def format_user_message(result: dict[str, Any]) -> str:

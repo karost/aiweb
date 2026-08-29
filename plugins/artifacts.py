@@ -1,8 +1,4 @@
-"""AI Web — failure artifacts (screenshots, HTML, text dumps).
-
-Paths under $HERMES_HOME/data/aiweb/failures/.
-Does not dump browser cookie DB; HTML may still be sensitive — dir perms 0700.
-"""
+"""AI Web — failure artifacts (screenshots, HTML, text dumps)."""
 
 from __future__ import annotations
 
@@ -11,7 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Sequence
 
 from . import memory_manager as mem
 
@@ -73,15 +69,14 @@ async def capture_page_artifacts(
     op: str,
     request_id: str,
     note: str = "",
+    extra_text: str = "",
 ) -> list[str]:
-    """
-    Best-effort screenshot + HTML from a Playwright page object.
-    Returns list of filesystem paths (strings).
-    """
     paths: list[str] = []
     out = new_failure_dir(op=op, request_id=request_id)
     if note:
         write_text_artifact(out, "note.txt", note)
+    if extra_text:
+        write_text_artifact(out, "debug_steps.txt", extra_text)
 
     try:
         html = await page.content()
@@ -96,12 +91,12 @@ async def capture_page_artifacts(
         write_text_artifact(out, "screenshot_error.txt", repr(e))
 
     try:
-        url = page.url
-        write_text_artifact(out, "url.txt", url or "")
+        write_text_artifact(out, "url.txt", page.url or "")
     except Exception:
         pass
 
     write_text_artifact(out, "meta.txt", f"op={op}\nrequest_id={request_id}\n")
+    paths.append(str(out))
     return paths
 
 
@@ -112,12 +107,12 @@ def capture_text_failure(
     note: str,
     body: str = "",
 ) -> list[str]:
-    """No browser — store note + optional body excerpt."""
     out = new_failure_dir(op=op, request_id=request_id)
     paths = [str(write_text_artifact(out, "note.txt", note))]
     if body:
         excerpt = body if len(body) <= 200_000 else body[:200_000] + "\n<!-- truncated -->\n"
         paths.append(str(write_text_artifact(out, "body.txt", excerpt)))
+    paths.append(str(out))
     return paths
 
 
