@@ -21,6 +21,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT.parent))
 
 from aiweb import memory_manager as mem
+from aiweb.artifacts import debug_logs_root, failures_root
 from aiweb.service import PROTOCOL_VERSION, handle
 from aiweb.session import get_session
 
