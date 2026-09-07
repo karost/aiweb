@@ -105,8 +105,8 @@ Profile cookies live under `~/.hermes/data/aiweb/browser_profile/`.
 
 | Command | What it does | Model inject? |
 |---------|--------------|---------------|
-| `/aiweb <prompt>` | Send prompt in **current** Grok conversation | Yes — final-only, on **next** Hermes turn |
-| `/aiweb-chat <prompt>` | Same, but answer is routed into the **Hermes chat** (agent turn) instead of the popup | Yes — final-only, on next Hermes turn |
+| `/aiweb <prompt>` | Send prompt in **current** Grok conversation; answer routed into the **Hermes chat** (agent turn) | Yes — final-only, on **next** Hermes turn (costs input tokens) |
+| `/aiweb-chat <prompt>` | Same chat routing, but **inject-free** to save input tokens | No |
 | `/aiweb-new [optional message]` | **Only** way to start a fresh Grok chat | No (unless you then use `/aiweb`) |
 | `/aiweb-write <path> <prompt>` | Ask Grok for code → write under out dir | No (or path-only if configured) |
 | `/aiweb-more` | Next chunk of last large answer | No |

@@ -394,7 +394,10 @@ def _handle_chat(
             error_code="invalid_args",
         )
 
-    do_inject = op in ("aiweb", "chat")
+    # Token policy: only /aiweb queues the final-only model inject.
+    # /aiweb-chat displays in chat without polluting the model context
+    # (saves input tokens); /aiweb pays the inject cost by design.
+    do_inject = op == "aiweb"
     sess = get_session()
     blocked = _acquire_heavy(sess, request_id, op)
     if blocked:
@@ -476,7 +479,13 @@ def _handle_chat(
         )
         body = format_chat_piece(pipe, 0)
         _mark_first_chunk_shown(pipe)
-        msg = f"{body}\n\n_({meta})_{_confidence_suffix(cap)}"
+        # [aiweb] /aiweb-chat output lands in the Hermes chat itself; drop the
+        # meta footer there (user request) except for multi-chunk answers,
+        # where the /aiweb-more + full-file pointer is still needed.
+        if op == "chat" and not more:
+            msg = f"{body}{_confidence_suffix(cap)}"
+        else:
+            msg = f"{body}\n\n_({meta})_{_confidence_suffix(cap)}"
 
         mem.append_hot_summary(f"[{op}] {message[:80]} → {pipe.path} {pipe.chars}c")
         op_ok = True
