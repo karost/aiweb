@@ -80,6 +80,10 @@ def acquire_singleton() -> None:
         os.chmod(_data(), 0o700)
     except OSError:
         pass
+    # Eagerly create artifact dirs so they always exist for tracing
+    # (previously they were only created lazily on the first failure).
+    failures_root()
+    debug_logs_root()
     pid_file = _pid_path()
     if pid_file.exists():
         try:
