@@ -106,7 +106,7 @@ Profile cookies live under `~/.hermes/data/aiweb/browser_profile/`.
 | Command | What it does | Model inject? |
 |---------|--------------|---------------|
 | `/aiweb <prompt>` | Send prompt in **current** Grok conversation | Yes — final-only, on **next** Hermes turn |
-| `/aiweb-chat <prompt>` | Same, but no inject | No |
+| `/aiweb-chat <prompt>` | Same, but answer is routed into the **Hermes chat** (agent turn) instead of the popup | Yes — final-only, on next Hermes turn |
 | `/aiweb-new [optional message]` | **Only** way to start a fresh Grok chat | No (unless you then use `/aiweb`) |
 | `/aiweb-write <path> <prompt>` | Ask Grok for code → write under out dir | No (or path-only if configured) |
 | `/aiweb-more` | Next chunk of last large answer | No |
@@ -212,7 +212,27 @@ Model inject (when used) is a **single** head+tail pack, never N chat fragments.
    ```
 
 4. Default is **one-shot**. `/aiweb-keep-model` makes it sticky until `/aiweb-clear-model`.
-5. Prefer `/aiweb-chat` when you want research without polluting Hermes context.
+5. `/aiweb-chat` additionally sends the answer into the Hermes chat as a user turn (see section 8.1), so Hermes replies to it in the conversation.
+
+### 8.1 `/aiweb-chat` in-chat routing (hermes gateway patch)
+
+Hermes hardcodes plugin slash-command output to the TUI popup/pager
+(`{"type": "plugin"}` in `tui_gateway/methods_tools.py`). To make
+`/aiweb-chat` show Grok's answer **in the chat conversation**, two small
+patches (marked `# [aiweb-patch]`) were applied to
+`~/.hermes/hermes-agent/tui_gateway/methods_tools.py`:
+
+- In the `command.dispatch` and `slash.exec` plugin branches, when the
+  command is `aiweb-chat` and the result is not an error, the gateway
+  returns `{"type": "send", "message": <answer>}` instead — the TUI then
+  submits it as a chat message and Hermes responds to it in the conversation.
+- Errors (`❌ …`, `Usage: …`) still go to the popup.
+
+Backup of the original file: `tui_gateway/methods_tools.py.bak-aiweb`.
+**A hermes update overwrites this patch** — re-apply it (search for
+`aiweb-patch` in this repo's history) or restore popup behaviour by
+restoring the backup. The daemon restarts pick up plugin-side changes
+automatically; the gateway patch needs a `hermes --tui` restart.
 
 ---
 
@@ -285,7 +305,7 @@ Rules:
 | New chat every time | Old V1/V2 behaviour or forced root navigation | Use V3; never call `/aiweb-new` unless you want a new thread |
 | Daemon spawn failed | Python / Playwright missing in daemon env | Set `HERMES_AIWEB_PYTHON` to the venv that has Playwright |
 | Two browsers / profile lock | Second daemon started | `/aiweb-stop daemon`, kill stale pids, start once |
-| Inject not appearing | Used `/aiweb-chat` or buffer cleared | Use `/aiweb`; check `/aiweb-status` → inject_pending |
+| Inject not appearing | Buffer cleared or already consumed | Check `/aiweb-status` → inject_pending |
 
 Artifacts live under:
 
