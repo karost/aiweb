@@ -6,11 +6,14 @@ V1-style anti-block launch + same-chat continuity:
   - Store / restore conversation_url
   - Simple V1 capture loop (text-diff + Stop button + stall)
   - Only /aiweb-new forces a fresh chat
+  - Capture confidence on new-diff vs chrome-stripped (not full page)
+  - Dead-browser detection so service._get_engine() can restart
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -27,6 +30,17 @@ GROK_URL = DEFAULT_GROK_URL
 # Stall after last growth before considering response complete (ms)
 STALL_MS = 2200.0
 MIN_ELAPSED = 5.0
+
+_DEAD_BROWSER_MARKERS = (
+    "target closed",
+    "target crashed",
+    "browser has been closed",
+    "context closed",
+    "connection closed",
+    "execution context was destroyed",
+    "browser not started",
+    "playwright connection",
+)
 
 
 def _profile_dir() -> Path:
@@ -74,7 +88,7 @@ def run_async(coro):
 
 
 # ---------------------------------------------------------------------------
-# Chrome / UI helpers (V1-style, minimal surface)
+# Chrome / UI helpers (V1-style, minimal surface) — do not "improve" these
 # ---------------------------------------------------------------------------
 
 _CHROME_LINES = re.compile(
@@ -135,6 +149,83 @@ def _diff_new_text(before: str, after: str) -> str:
     return after[i:].lstrip()
 
 
+def _is_dead_browser_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "targetclosed" in name or "targetclosederror" in name:
+        return True
+    return any(m in msg for m in _DEAD_BROWSER_MARKERS)
+
+
+def _persisted_conversation_url() -> Optional[str]:
+    """Last conversation_url from state.json (daemon restart). Avoids importing session."""
+    try:
+        path = mem.data_dir() / "state.json"
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    url = data.get("conversation_url")
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    low = url.lower()
+    if url and "grok" in low and "login" not in low and "flow/" not in low:
+        return url
+    return None
+
+
+def _capture_confidence(
+    *,
+    raw_new: str,
+    cleaned: str,
+    network: str = "",
+    stable: str = "",
+    extract: str = "",
+) -> float:
+    """Score extraction quality.
+
+    Compare chrome-stripped reply to the *new-diff window*, never to the
+    full page body (that ratio is always tiny and false-alarms).
+
+    Short non-chrome answers ("Yes.", "42", "Done.") stay high-confidence.
+    Low confidence = we threw away most of a large new-diff, or candidates disagree.
+    """
+    cleaned = (cleaned or "").strip()
+    raw_new = (raw_new or "").strip()
+    if not cleaned:
+        return 0.0
+    if _is_chrome_line(cleaned) or _looks_like_nav_block(cleaned):
+        return 0.15
+
+    # Real short answers are fine.
+    if len(cleaned) < 40:
+        base = 0.85
+    else:
+        base = 0.9
+
+    if raw_new:
+        ratio = len(cleaned) / max(1, len(raw_new))
+        if len(raw_new) > 400 and ratio < 0.15:
+            base = min(base, 0.28)
+        elif len(raw_new) > 400 and ratio < 0.35:
+            base = min(base, 0.45)
+        elif ratio >= 0.5:
+            base = max(base, 0.75)
+
+    cands = [c.strip() for c in (stable, extract, network) if (c or "").strip()]
+    if len(cands) >= 2:
+        lengths = sorted(len(c) for c in cands)
+        if lengths[-1] > 80 and lengths[0] * 3 < lengths[-1]:
+            base = min(base, 0.5)
+
+    if network and cleaned == network:
+        base = max(base, 0.7)
+
+    return round(min(1.0, max(0.0, base)), 2)
+
+
 @dataclass
 class CaptureResult:
     ok: bool
@@ -145,6 +236,7 @@ class CaptureResult:
     error: Optional[str] = None
     error_code: Optional[str] = None
     artifacts: list = field(default_factory=list)
+    confidence: float = 1.0
 
 
 class BrowserEngine:
@@ -165,12 +257,18 @@ class BrowserEngine:
         self._text_before_send = ""
         self._sent_message = ""
         self._last_stable_reply = ""
+        self._last_raw_new = ""
+        self._last_confidence = 1.0
         self._conversation_url: Optional[str] = None  # same-chat key
         self._first_open_done = False
         self._closing = False
 
     def is_up(self) -> bool:
         return bool(self._up and self._page is not None and not self._closing)
+
+    def _mark_dead(self) -> None:
+        """Page/context is gone. Keep refs so stop() can still try to close."""
+        self._up = False
 
     @property
     def page(self):
@@ -179,7 +277,9 @@ class BrowserEngine:
     def current_url(self) -> str:
         try:
             return self._page.url if self._page else ""
-        except Exception:
+        except Exception as e:
+            if _is_dead_browser_error(e):
+                self._mark_dead()
             return ""
 
     def conversation_url(self) -> Optional[str]:
@@ -223,6 +323,12 @@ class BrowserEngine:
                 append_debug_log(request_id, line)
             except Exception:
                 pass
+
+    def _error_code_for(self, exc: BaseException) -> str:
+        if _is_dead_browser_error(exc):
+            self._mark_dead()
+            return "browser_dead"
+        return "internal"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -305,6 +411,7 @@ class BrowserEngine:
           - force=False  → only navigate if we have no usable Grok tab
           - force=True   → used only by /aiweb-new
         After first successful open we never go back to root URL.
+        On a cold start, prefer restoring the last conversation_url.
         """
         await self.start()
         assert self._page is not None
@@ -321,8 +428,10 @@ class BrowserEngine:
             try:
                 await self._find_input()
                 self._remember_conversation()
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_dead_browser_error(e):
+                    self._mark_dead()
+                    raise
             return
 
         if not force and "grok" in url:
@@ -331,13 +440,34 @@ class BrowserEngine:
                 self._first_open_done = True
                 self._remember_conversation()
                 return
-            except Exception:
+            except Exception as e:
+                if _is_dead_browser_error(e):
+                    self._mark_dead()
+                    raise
                 # On Grok but composer missing → still do not force-reload unless forced
                 self._first_open_done = True
                 return
 
-        # First open or explicit force
-        await self._page.goto(DEFAULT_GROK_URL, wait_until="domcontentloaded", timeout=90_000)
+        # First open or explicit force.
+        # Restore last conversation when this is not /aiweb-new.
+        target = DEFAULT_GROK_URL
+        if not force:
+            restored = self._conversation_url or _persisted_conversation_url()
+            if restored:
+                target = restored
+
+        try:
+            await self._page.goto(target, wait_until="domcontentloaded", timeout=90_000)
+        except Exception as e:
+            if _is_dead_browser_error(e):
+                self._mark_dead()
+                raise
+            if target != DEFAULT_GROK_URL:
+                await self._page.goto(
+                    DEFAULT_GROK_URL, wait_until="domcontentloaded", timeout=90_000
+                )
+            else:
+                raise
         await asyncio.sleep(1.5)
         self._first_open_done = True
         self._remember_conversation()
@@ -359,7 +489,10 @@ class BrowserEngine:
             return True
         try:
             content = (await self._page.locator("body").inner_text(timeout=3000)).lower()
-        except Exception:
+        except Exception as e:
+            if _is_dead_browser_error(e):
+                self._mark_dead()
+                raise
             return False
         url = (self._page.url or "").lower()
         if "flow/login" in url or url.rstrip("/").endswith("/login"):
@@ -392,8 +525,10 @@ class BrowserEngine:
                         return True
                     except Exception:
                         pass
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_dead_browser_error(e):
+                    self._mark_dead()
+                    return False
             await asyncio.sleep(2.0)
         return False
 
@@ -414,6 +549,7 @@ class BrowserEngine:
                         page_url=self.current_url(),
                         conversation_url=self._conversation_url,
                         text="login_ok",
+                        confidence=1.0,
                     )
                 except Exception:
                     pass
@@ -425,6 +561,7 @@ class BrowserEngine:
                     page_url=self.current_url(),
                     conversation_url=self._conversation_url,
                     text="login_ok",
+                    confidence=1.0,
                 )
             arts = await self._artifacts("login", rid, "login wall still present", steps)
             return CaptureResult(
@@ -434,10 +571,17 @@ class BrowserEngine:
                 error_code="needs_login",
                 artifacts=arts,
                 page_url=self.current_url(),
+                confidence=0.0,
             )
         except Exception as e:
             self._dbg(rid, f"login exception {e!r}", steps)
-            return CaptureResult(ok=False, error=str(e), error_code="browser_dead", artifacts=[])
+            return CaptureResult(
+                ok=False,
+                error=str(e),
+                error_code=self._error_code_for(e),
+                artifacts=[],
+                confidence=0.0,
+            )
 
     # ------------------------------------------------------------------
     # Input discovery (V1 selectors, ordered by stability)
@@ -475,9 +619,15 @@ class BrowserEngine:
                     try:
                         if await item.is_visible(timeout=400):
                             return item
-                    except Exception:
+                    except Exception as e:
+                        if _is_dead_browser_error(e):
+                            self._mark_dead()
+                            raise
                         continue
-            except Exception:
+            except Exception as e:
+                if _is_dead_browser_error(e):
+                    self._mark_dead()
+                    raise
                 continue
         if save_on_fail:
             await self.save_failure_artifact("no_input")
@@ -561,33 +711,41 @@ class BrowserEngine:
         self._last_network_text = None
         self._network_done = False
         self._last_stable_reply = ""
+        self._last_raw_new = ""
+        self._last_confidence = 0.0
         self._sent_message = message
 
         # Critical: stay on current page (same-chat). No goto.
-        input_box = await self._find_input()
-        await input_box.click()
-        await asyncio.sleep(0.25)
-        await input_box.fill("")
-        await input_box.fill(message)
-        await asyncio.sleep(0.35)
-        await input_box.press("Enter")
+        try:
+            input_box = await self._find_input()
+            await input_box.click()
+            await asyncio.sleep(0.25)
+            await input_box.fill("")
+            await input_box.fill(message)
+            await asyncio.sleep(0.35)
+            await input_box.press("Enter")
 
-        self._text_before_send = await self._page_text()
-        print(
-            f"  [send] entered; waiting up to {timeout}s for NEW page text "
-            f"(baseline_len={len(self._text_before_send)})",
-            file=__import__("sys").stderr,
-            flush=True,
-        )
+            self._text_before_send = await self._page_text()
+            print(
+                f"  [send] entered; waiting up to {timeout}s for NEW page text "
+                f"(baseline_len={len(self._text_before_send)})",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
 
-        await self._wait_for_response_stable(timeout=timeout)
-        response = await self._extract_last_response()
+            await self._wait_for_response_stable(timeout=timeout)
+            response = await self._extract_last_response()
+        except Exception as e:
+            if _is_dead_browser_error(e):
+                self._mark_dead()
+            raise
 
         candidates = []
         if self._last_stable_reply and self._last_stable_reply.strip():
             candidates.append(self._last_stable_reply.strip())
         if response and response.strip():
             candidates.append(response.strip())
+        net = ""
         if self._last_network_text:
             net = _strip_chrome(self._last_network_text, self._sent_message)
             if net:
@@ -600,11 +758,20 @@ class BrowserEngine:
             if lines and lines[0].lower().startswith("thought for"):
                 result = "\n".join(lines[1:]).strip() or result
 
+        self._last_confidence = _capture_confidence(
+            raw_new=self._last_raw_new,
+            cleaned=result,
+            network=net,
+            stable=self._last_stable_reply,
+            extract=response or "",
+        )
+
         if not result or _is_chrome_line(result) or _looks_like_nav_block(result):
             await self.save_failure_artifact("empty_response")
+            self._last_confidence = 0.0
             print(
                 f"  [send] EMPTY extract stable_len={len(self._last_stable_reply or '')} "
-                f"extract_len={len(response or '')}",
+                f"extract_len={len(response or '')} conf={self._last_confidence}",
                 file=__import__("sys").stderr,
                 flush=True,
             )
@@ -613,7 +780,8 @@ class BrowserEngine:
         self._remember_conversation()
         print(
             f"  [send] return_len={len(result)} "
-            f"(stable={len(self._last_stable_reply or '')} extract={len(response or '')})",
+            f"(stable={len(self._last_stable_reply or '')} extract={len(response or '')} "
+            f"conf={self._last_confidence})",
             file=__import__("sys").stderr,
             flush=True,
         )
@@ -622,7 +790,9 @@ class BrowserEngine:
     async def _page_text(self) -> str:
         try:
             return await self._page.locator("body").inner_text(timeout=4000)
-        except Exception:
+        except Exception as e:
+            if _is_dead_browser_error(e):
+                self._mark_dead()
             return ""
 
     async def _ui_still_generating(self) -> bool:
@@ -637,10 +807,14 @@ class BrowserEngine:
                 try:
                     if await stop.first.is_visible(timeout=200):
                         return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    if _is_dead_browser_error(e):
+                        self._mark_dead()
+                        raise
+        except Exception as e:
+            if _is_dead_browser_error(e):
+                self._mark_dead()
+                raise
         try:
             low = (await self._page_text()).lower()
             for marker in (
@@ -662,6 +836,8 @@ class BrowserEngine:
         sent = self._sent_message
         if sent and new.startswith(sent):
             new = new[len(sent) :].lstrip()
+        # Keep pre-strip new-diff for confidence (not the full page).
+        self._last_raw_new = new
         new = _strip_chrome(new, sent)
         if _looks_like_nav_block(new):
             new = ""
@@ -777,6 +953,8 @@ class BrowserEngine:
         sent = self._sent_message
         if sent and new.startswith(sent):
             new = new[len(sent) :].strip()
+        if not self._last_raw_new:
+            self._last_raw_new = new
         new = _strip_chrome(new, sent)
         if not new or _looks_like_nav_block(new):
             return ""
@@ -813,7 +991,11 @@ class BrowserEngine:
         steps: list[str] = []
         rid = request_id or "noreqid"
         try:
-            self._dbg(rid, f"submit_and_capture op={op} force_new={force_new} prompt_len={len(prompt)}", steps)
+            self._dbg(
+                rid,
+                f"submit_and_capture op={op} force_new={force_new} prompt_len={len(prompt)}",
+                steps,
+            )
             await self.start()
             await self.ensure_on_grok(force=force_new)
             self._dbg(
@@ -825,14 +1007,19 @@ class BrowserEngine:
             try:
                 await self._find_input()
             except Exception as e:
+                if _is_dead_browser_error(e):
+                    self._mark_dead()
                 arts = await self._artifacts(op, rid, "no composer on grok tab", steps)
                 return CaptureResult(
                     ok=False,
                     needs_login=False,
                     error=str(e),
-                    error_code="empty_extract",
+                    error_code=self._error_code_for(e)
+                    if _is_dead_browser_error(e)
+                    else "empty_extract",
                     artifacts=arts,
                     page_url=self.current_url(),
+                    confidence=0.0,
                 )
 
             if await self.is_login_required():
@@ -844,10 +1031,16 @@ class BrowserEngine:
                     error_code="needs_login",
                     artifacts=arts,
                     page_url=self.current_url(),
+                    confidence=0.0,
                 )
 
             text = await self.send_message(prompt, timeout=int(_timeout_sec()))
-            self._dbg(rid, f"captured_len={len(text or '')} net={bool(self._last_network_text)}", steps)
+            conf = float(self._last_confidence or 0.0)
+            self._dbg(
+                rid,
+                f"captured_len={len(text or '')} net={bool(self._last_network_text)} conf={conf}",
+                steps,
+            )
 
             if not (text or "").strip() or text == "(No response extracted)":
                 arts = await self._artifacts(op, rid, "empty response", steps)
@@ -858,6 +1051,7 @@ class BrowserEngine:
                     artifacts=arts,
                     page_url=self.current_url(),
                     conversation_url=self._conversation_url,
+                    confidence=0.0,
                 )
 
             return CaptureResult(
@@ -865,6 +1059,7 @@ class BrowserEngine:
                 text=text,
                 page_url=self.current_url(),
                 conversation_url=self._conversation_url,
+                confidence=conf,
             )
         except Exception as e:
             self._dbg(rid, f"exception {e!r}", steps)
@@ -872,9 +1067,10 @@ class BrowserEngine:
             return CaptureResult(
                 ok=False,
                 error=str(e),
-                error_code="internal",
+                error_code=self._error_code_for(e),
                 artifacts=arts,
                 page_url=self.current_url(),
+                confidence=0.0,
             )
 
     async def start_new_conversation(self) -> CaptureResult:
@@ -901,12 +1097,17 @@ class BrowserEngine:
                         await asyncio.sleep(1.2)
                         clicked = True
                         break
-                except Exception:
+                except Exception as e:
+                    if _is_dead_browser_error(e):
+                        self._mark_dead()
+                        raise
                     continue
 
             if not clicked:
                 # Fallback: navigate to root (only place we intentionally do this)
-                await self._page.goto(DEFAULT_GROK_URL, wait_until="domcontentloaded", timeout=60_000)
+                await self._page.goto(
+                    DEFAULT_GROK_URL, wait_until="domcontentloaded", timeout=60_000
+                )
                 await asyncio.sleep(1.5)
 
             self._conversation_url = None
@@ -920,9 +1121,12 @@ class BrowserEngine:
                 return CaptureResult(
                     ok=False,
                     error=str(e),
-                    error_code="empty_extract",
+                    error_code=self._error_code_for(e)
+                    if _is_dead_browser_error(e)
+                    else "empty_extract",
                     artifacts=arts,
                     page_url=self.current_url(),
+                    confidence=0.0,
                 )
 
             return CaptureResult(
@@ -930,9 +1134,15 @@ class BrowserEngine:
                 text="new conversation started",
                 page_url=self.current_url(),
                 conversation_url=self._conversation_url,
+                confidence=1.0,
             )
         except Exception as e:
-            return CaptureResult(ok=False, error=str(e), error_code="internal")
+            return CaptureResult(
+                ok=False,
+                error=str(e),
+                error_code=self._error_code_for(e),
+                confidence=0.0,
+            )
 
     # ------------------------------------------------------------------
     # Artifacts
@@ -970,4 +1180,5 @@ __all__ = [
     "DEFAULT_GROK_URL",
     "run_async",
     "_headed_default",
+    "_capture_confidence",
 ]

@@ -13,13 +13,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import memory_manager as mem
-from .service import PROTOCOL_VERSION
+
+# Keep this local. Importing .service pulls browser_engine → Playwright into the
+# TUI/slash process, which is the failure mode this client exists to avoid.
+PROTOCOL_VERSION = 1
 
 SOCK_NAME = "daemon.sock"
 PID_NAME = "daemon.pid"
 CONNECT_TIMEOUT = 2.0
 REQUEST_TIMEOUT = float(os.environ.get("HERMES_AIWEB_CLIENT_TIMEOUT", "600"))
 SPAWN_WAIT_SEC = 25.0
+MAX_SPAWN_LOG_BYTES = 1_000_000  # 1 MB cap at spawn time
+SPAWN_LOG_KEEP = MAX_SPAWN_LOG_BYTES // 2
 
 
 def _sock_path() -> Path:
@@ -28,6 +33,10 @@ def _sock_path() -> Path:
 
 def _pid_path() -> Path:
     return mem.data_dir() / PID_NAME
+
+
+def _spawn_log_path() -> Path:
+    return mem.data_dir() / "daemon_spawn.err"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -68,55 +77,82 @@ def _daemon_python() -> str:
     return sys.executable
 
 
-def _hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+def _verbose_errors() -> bool:
+    return os.environ.get("HERMES_AIWEB_VERBOSE_ERRORS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
-def _hermes_plugins_dir() -> Path:
-    """Directory that contains the package name 'aiweb' (symlink)."""
-    return _hermes_home() / "plugins"
+def _tail_bytes(path: Path, max_bytes: int) -> bytes:
+    """Read at most the last max_bytes of path without loading the whole file."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            return f.read()
+    except OSError:
+        return b""
 
 
-def _daemon_python() -> str:
-    """Prefer Hermes venv Python so Playwright resolves correctly."""
-    env = (os.environ.get("HERMES_AIWEB_PYTHON") or "").strip()
-    if env and Path(env).is_file():
-        return env
-    candidate = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
-    if candidate.is_file():
-        return str(candidate)
-    return sys.executable
+def _tail_text(path: Path, max_bytes: int) -> str:
+    data = _tail_bytes(path, max_bytes)
+    if not data:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    if len(data) >= max_bytes:
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1 :]
+    return text
+
+
+def _rotate_spawn_log(path: Path) -> None:
+    """Trim daemon_spawn.err at spawn time (old writer must already be dead).
+
+    Does not cap a keep-alive daemon's open fd — that requires daemon-side
+    rotation. Uses seek, never read_text() of the whole file.
+    """
+    try:
+        if not path.exists():
+            return
+        size = path.stat().st_size
+        if size <= MAX_SPAWN_LOG_BYTES:
+            return
+        text = _tail_text(path, SPAWN_LOG_KEEP)
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _spawn_daemon() -> None:
-    """Start daemon as detached subprocess using same Python."""
     mem.data_dir().mkdir(parents=True, exist_ok=True)
     plugins_dir = _hermes_plugins_dir()
     env = os.environ.copy()
-    env.setdefault("HERMES_HOME", str(mem.data_dir().parent.parent))
+    env["HERMES_HOME"] = str(_hermes_home())
+    py = _daemon_python()
+    cmd = [py, "-m", "aiweb.daemon"]
 
-    # Prefer: python -m aiweb.daemon with plugins on PYTHONPATH
-    cmd = [sys.executable, "-m", "aiweb.daemon"]
-    try:
-        subprocess.Popen(
-            cmd,
-            cwd=str(plugins_dir),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError:
-        # Fallback: run daemon.py as file
-        daemon_py = _plugin_root() / "daemon.py"
-        subprocess.Popen(
-            [sys.executable, str(daemon_py)],
-            cwd=str(plugins_dir),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+    err_path = _spawn_log_path()
+    _rotate_spawn_log(err_path)
+    err_f = open(err_path, "a", encoding="utf-8")
+    err_f.write(
+        f"\n--- spawn {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"cmd={cmd!r} cwd={str(plugins_dir)!r}\n"
+    )
+    err_f.flush()
+
+    subprocess.Popen(
+        cmd,
+        cwd=str(plugins_dir),
+        env=env,
+        stdout=err_f,
+        stderr=err_f,
+        start_new_session=True,
+    )
 
 
 def _connect() -> socket.socket:
@@ -131,7 +167,7 @@ def _recv_json(sock: socket.socket) -> dict[str, Any]:
     buf = bytearray()
     while True:
         if b"\n" in buf:
-            line, _, rest = buf.partition(b"\n")
+            line, _, _ = buf.partition(b"\n")
             return json.loads(line.decode("utf-8"))
         chunk = sock.recv(65536)
         if not chunk:
@@ -182,8 +218,6 @@ def daemon_is_live() -> bool:
 def ensure_daemon() -> None:
     if daemon_is_live():
         return
-
-    # Stale pid/sock cleanup
     pid = _read_pid()
     if pid is not None and not _pid_alive(pid):
         for p in (_pid_path(), _sock_path()):
@@ -202,12 +236,16 @@ def ensure_daemon() -> None:
                 return
         except Exception as e:
             last_err = str(e)
-    raise RuntimeError(
-        "spawn_failed: could not start AI Web daemon. "
-        f"Last error: {last_err}. "
-        "Check: pip install playwright && playwright install chromium; "
-        f"data dir={mem.data_dir()}"
-    )
+    err_file = _spawn_log_path()
+    extra = ""
+    if err_file.exists():
+        try:
+            tail = _tail_text(err_file, 2000)
+            if tail:
+                extra = "\n" + tail
+        except OSError:
+            pass
+    raise RuntimeError(f"spawn_failed: {last_err}. Check {err_file}.{extra}")
 
 
 def request(op: str, **args: Any) -> dict[str, Any]:
@@ -245,23 +283,17 @@ def request(op: str, **args: Any) -> dict[str, Any]:
                 "request_id": request_id,
                 "error": str(e2),
                 "error_code": "spawn_failed",
-                "artifacts": [],
-                "path": "none",
-                "chars": 0,
-                "full_path": None,
-                "gen_id": None,
-                "more_available": False,
-                "inject": {
-                    "written": False,
-                    "pending": False,
-                    "chars": 0,
-                    "mode": "none",
-                    "distill_method": None,
-                    "capped": False,
-                    "cap": None,
-                },
                 "op": op,
             }
+    except Exception as e:
+        return {
+            "ok": False,
+            "message": f"client error: {e}",
+            "request_id": request_id,
+            "error": str(e),
+            "error_code": "spawn_failed",
+            "op": op,
+        }
 
 
 def format_user_message(result: dict[str, Any]) -> str:
@@ -270,9 +302,23 @@ def format_user_message(result: dict[str, Any]) -> str:
     if result.get("ok"):
         return result.get("message") or "✅ OK"
     code = result.get("error_code") or ""
-    msg = result.get("message") or result.get("error") or "error"
+    if code == "internal" and not _verbose_errors():
+        log = _spawn_log_path()
+        msg = (
+            "internal error — see daemon log "
+            f"(`{log}` / stderr) for details. "
+            "Set HERMES_AIWEB_VERBOSE_ERRORS=1 to show the exception."
+        )
+    else:
+        msg = result.get("message") or result.get("error") or "error"
     prefix = f"❌ [{code}] " if code else "❌ "
     return prefix + str(msg)
 
 
-__all__ = ["ensure_daemon", "request", "daemon_is_live", "format_user_message", "PROTOCOL_VERSION"]
+__all__ = [
+    "ensure_daemon",
+    "request",
+    "daemon_is_live",
+    "format_user_message",
+    "PROTOCOL_VERSION",
+]
