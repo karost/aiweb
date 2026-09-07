@@ -39,7 +39,7 @@ commands:
   - name: aiweb
     description: Grok research in current conversation; final-only inject on next Hermes turn
   - name: aiweb-chat
-    description: Grok research in current conversation; no model inject
+    description: Grok research in current conversation; final-only inject on next Hermes turn
   - name: aiweb-new
     description: Start a fresh Grok conversation (only command that opens new chat)
   - name: aiweb-write
@@ -69,4 +69,5 @@ notes:
   - Browser is owned by the AI Web daemon only.
   - Same-chat by default. Only /aiweb-new starts a new conversation.
   - Inject applies on the next agent LLM call (pre_llm_call).
+  - Agent tool aiweb_grok_chat lets the model consult Grok in-chat; the tool result joins the conversation.
   - Automating Grok/x.com may violate ToS — personal use at your own risk.

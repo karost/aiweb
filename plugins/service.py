@@ -394,7 +394,7 @@ def _handle_chat(
             error_code="invalid_args",
         )
 
-    do_inject = op == "aiweb"
+    do_inject = op in ("aiweb", "chat")
     sess = get_session()
     blocked = _acquire_heavy(sess, request_id, op)
     if blocked:

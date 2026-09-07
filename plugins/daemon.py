@@ -1,10 +1,9 @@
 """AI Web V3 — session daemon (owns Playwright + service.handle).
-
-Long-lived process. Browser is started once and kept warm.
-"""
-
+ Long-lived process. Browser is started once and kept warm.
+ """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -21,6 +20,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT.parent))
 
 from aiweb import memory_manager as mem
+from aiweb.artifacts import debug_logs_root, failures_root
 from aiweb.service import PROTOCOL_VERSION, handle
 from aiweb.session import get_session
 
@@ -79,6 +79,10 @@ def acquire_singleton() -> None:
         os.chmod(_data(), 0o700)
     except OSError:
         pass
+    # Eagerly create artifact dirs so they always exist for tracing
+    # (previously they were only created lazily on the first failure).
+    failures_root()
+    debug_logs_root()
     pid_file = _pid_path()
     if pid_file.exists():
         try:
@@ -135,12 +139,11 @@ def _handle_connection(conn: socket.socket) -> None:
             if not isinstance(req, dict):
                 _send(conn, {"ok": False, "error": "invalid request", "error_code": "invalid_args"})
                 continue
-
             req_id = str(req.get("id") or "")
             op = str(req.get("op") or "").strip().lower()
             args = req.get("args") if isinstance(req.get("args"), dict) else {}
             request_id = str(req.get("request_id") or args.get("request_id") or req_id or "")
-
+            
             if op == "hello":
                 client_proto = int(args.get("protocol_version") or req.get("protocol_version") or 1)
                 if client_proto != PROTOCOL_VERSION:
@@ -154,7 +157,7 @@ def _handle_connection(conn: socket.socket) -> None:
                     "daemon_version": DAEMON_VERSION, "message": "hello",
                 })
                 continue
-
+            
             try:
                 result = handle(op, request_id=request_id, **args)
             except Exception as e:
@@ -163,11 +166,11 @@ def _handle_connection(conn: socket.socket) -> None:
                     "error": str(e), "error_code": "internal", "op": op,
                 }
                 traceback.print_exc()
-
+            
             result = dict(result)
             result["id"] = req_id
             _send(conn, result)
-
+            
             if op == "stop" and (args.get("daemon") or args.get("stop_daemon")):
                 _exit_after_stop = True
                 _stop_flag.set()
@@ -189,7 +192,7 @@ def main() -> None:
             sock_path.unlink()
         except OSError:
             pass
-
+    
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
     server.listen(8)
@@ -202,13 +205,19 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sig)
 
     print(f"[aiweb-daemon] v{DAEMON_VERSION} listening on {sock_path}", flush=True)
-
     try:
         while not _stop_flag.is_set():
             try:
                 conn, _ = server.accept()
-            except socket.timeout:
+            except (socket.timeout, TimeoutError, InterruptedError):
+                # Handle standard timeout and interrupted system calls (EINTR)
                 continue
+            except OSError as e:
+                # Handle OS-level transient errors (EINTR, EAGAIN, EWOULDBLOCK)
+                if e.errno in (errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                raise  # Re-raise fatal errors (e.g., Bad file descriptor)
+            
             t = threading.Thread(target=_handle_connection, args=(conn,), daemon=True)
             t.start()
     finally:

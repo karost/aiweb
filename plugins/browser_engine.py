@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,22 +70,35 @@ def _headed_default() -> bool:
     return v in {"1", "true", "yes", "on", ""}
 
 
+_shared_loop: Optional[asyncio.AbstractEventLoop] = None
+_shared_loop_lock = threading.Lock()
+
+
+def _get_shared_loop() -> asyncio.AbstractEventLoop:
+    """One long-lived event loop for the whole daemon lifetime.
+
+    Playwright objects bind to the loop that created them. The old
+    run_async() used asyncio.run() per call, which closed each loop on
+    return — every later await on the persistent context then hung forever
+    (its transport reader task died with the old loop, so responses never
+    arrived and no timeout could fire). All engine coroutines must share a
+    single loop running in a dedicated thread.
+    """
+    global _shared_loop
+    with _shared_loop_lock:
+        if _shared_loop is None or _shared_loop.is_closed():
+            _shared_loop = asyncio.new_event_loop()
+            threading.Thread(
+                target=_shared_loop.run_forever,
+                name="aiweb-asyncio",
+                daemon=True,
+            ).start()
+        return _shared_loop
+
+
 def run_async(coro):
-    """Run coroutine from sync context (daemon service handlers)."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        try:
-            import nest_asyncio
-            nest_asyncio.apply()
-            return loop.run_until_complete(coro)
-        except ImportError:
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(asyncio.run, coro).result()
-    return asyncio.run(coro)
+    """Run coroutine on the daemon's single shared event loop (blocking)."""
+    return asyncio.run_coroutine_threadsafe(coro, _get_shared_loop()).result()
 
 
 # ---------------------------------------------------------------------------

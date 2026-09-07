@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from . import memory_manager as mem
+from .client import format_user_message, request
 from .commands import COMMAND_HANDLERS, dispatch
 
 __version__ = "3.0.0"
@@ -54,6 +55,21 @@ def _wrap_handler(name: str) -> Callable[..., str]:
     return _handler
 
 
+def _tool_grok_chat(message: str = "", **kwargs: Any) -> str:
+    """Agent tool: ask Grok via the browser daemon; the result joins the
+    conversation transcript so Hermes can answer in chat (no popup)."""
+    msg = str(message or "").strip()
+    if not msg and kwargs:
+        for key in ("query", "prompt", "question", "text", "arg", "args"):
+            value = kwargs.get(key)
+            if isinstance(value, str) and value.strip():
+                msg = value.strip()
+                break
+    if not msg:
+        return "Error: 'message' is required."
+    return format_user_message(request("chat", message=msg))
+
+
 def register(ctx: Any = None) -> None:
     handlers = {name: _wrap_handler(name) for name in COMMAND_HANDLERS}
 
@@ -68,6 +84,32 @@ def register(ctx: Any = None) -> None:
                         reg_cmd(f"/{name}", fn)
                     except Exception:
                         pass
+
+        reg_tool = getattr(ctx, "register_tool", None)
+        if callable(reg_tool):
+            try:
+                reg_tool(
+                    name="aiweb_grok_chat",
+                    toolset="web",
+                    schema={
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Question or prompt to send to Grok (x.com web AI).",
+                            }
+                        },
+                        "required": ["message"],
+                    },
+                    handler=_tool_grok_chat,
+                    description=(
+                        "Ask Grok (x.com web AI) a question through the persistent "
+                        "browser daemon and return its answer. Use when the user asks "
+                        "to consult Grok/aiweb. Reuses the current Grok conversation."
+                    ),
+                )
+            except Exception:
+                pass
 
         reg_hook = getattr(ctx, "register_hook", None)
         if callable(reg_hook):
