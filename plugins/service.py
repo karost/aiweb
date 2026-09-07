@@ -14,7 +14,7 @@ from .artifacts import capture_text_failure, format_artifacts_suffix
 from .browser_engine import BrowserEngine, CaptureResult, run_async
 from .distill import final_only
 from .response_pipeline import format_chat_meta, next_more, process_response
-from .session import HEAVY_OPS, get_session
+from .session import get_session
 from .write_policy import (
     atomic_write,
     extract_primary_code,
@@ -152,6 +152,14 @@ def handle(op: str, **kwargs: Any) -> dict[str, Any]:
         return _handle_write(request_id, **kwargs)
     if op == "login":
         return _handle_login(request_id, **kwargs)
+    if op == "run":
+        return _handle_run(request_id, **kwargs)
+    if op == "load":
+        return _handle_load(request_id, **kwargs)
+    if op == "reset_memory":
+        return _handle_reset_memory(request_id)
+    if op == "summary":
+        return _handle_summary(request_id, **kwargs)
 
     return _base_result(
         ok=False,
@@ -251,7 +259,6 @@ def _handle_stop(request_id: str, **kwargs: Any) -> dict[str, Any]:
     msg = "Browser session closed."
     if stop_daemon:
         msg += " Daemon will exit after response."
-        # daemon.py watches this via kwargs passthrough / env flag if needed
     return _base_result(
         ok=True,
         message=msg,
@@ -291,7 +298,7 @@ def _handle_login(request_id: str, **kwargs: Any) -> dict[str, Any]:
         sess.end_heavy(ok=True)
         return _base_result(
             ok=True,
-            message="Login OK — session ready.",
+            message="Login OK — session kept alive in daemon.",
             request_id=request_id,
             op="login",
         )
@@ -413,10 +420,7 @@ def _handle_chat(op: str, request_id: str, **kwargs: Any) -> dict[str, Any]:
             inject_note=inject_note if do_inject else "no inject",
         )
         body = pipe.chat_piece
-        if len(body) > 50:
-            msg = f"{body}\n\n_({meta})_"
-        else:
-            msg = f"{body}\n\n_({meta})_"
+        msg = f"{body}\n\n_({meta})_"
 
         mem.append_hot_summary(f"[{op}] {message[:80]} → {pipe.path} {pipe.chars}c")
 
@@ -587,6 +591,77 @@ def _handle_write(request_id: str, **kwargs: Any) -> dict[str, Any]:
             error=str(e),
             error_code="internal",
         )
+
+
+def _handle_reset_memory(request_id: str) -> dict[str, Any]:
+    mem.clear_model_context()
+    mem.set_sticky(False)
+    for name in ("hot_context.md", "archive.md"):
+        p = mem.data_dir() / name
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    mem.append_hot_summary("memory reset")
+    return _base_result(
+        ok=True,
+        message="AI Web hot/archive memory reset (model inject cleared).",
+        request_id=request_id,
+        op="reset_memory",
+    )
+
+
+def _handle_summary(request_id: str, **kwargs: Any) -> dict[str, Any]:
+    text = (kwargs.get("message") or kwargs.get("text") or kwargs.get("args") or "").strip()
+    if not text:
+        text = "Manual summary"
+    mem.append_hot_summary(text)
+    return _base_result(
+        ok=True,
+        message="Summary saved.",
+        request_id=request_id,
+        op="summary",
+    )
+
+
+def _handle_run(request_id: str, **kwargs: Any) -> dict[str, Any]:
+    prompt = (kwargs.get("message") or kwargs.get("prompt") or "").strip()
+    if not prompt:
+        return _base_result(
+            ok=False,
+            message="Usage: /aiweb-run <prompt>",
+            request_id=request_id,
+            op="run",
+            error="empty prompt",
+            error_code="invalid_args",
+        )
+    return _handle_chat(
+        "aiweb",
+        request_id,
+        message=(
+            f"{prompt}\n\n"
+            "IMPORTANT: Reply with ONLY complete runnable Python code. "
+            "Markdown code block OK."
+        ),
+    )
+
+
+def _handle_load(request_id: str, **kwargs: Any) -> dict[str, Any]:
+    extra = (kwargs.get("message") or kwargs.get("prompt") or "").strip()
+    hot = ""
+    try:
+        hot = mem.read_text(mem.data_dir() / "hot_context.md", default="")
+    except Exception:
+        hot = ""
+    context_message = (
+        "You are continuing a previous conversation. Context:\n\n"
+        f"{hot or '(empty)'}\n\n"
+        "Acknowledge briefly that you received this context."
+    )
+    if extra:
+        context_message += f"\n\nExtra: {extra}"
+    return _handle_chat("aiweb", request_id, message=context_message)
 
 
 __all__ = ["handle", "PROTOCOL_VERSION", "model_pack_cap"]

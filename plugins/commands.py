@@ -97,7 +97,29 @@ def cmd_aiweb_keep_model(arg: str = "") -> str:
     return format_user_message(result)
 
 
-# Map for __init__.py registration
+def cmd_aiweb_run(arg: str = "") -> str:
+    msg = (arg or "").strip()
+    if not msg:
+        return "Usage: /aiweb-run <prompt>"
+    result = request("run", message=msg)
+    return format_user_message(result)
+
+
+def cmd_aiweb_load(arg: str = "") -> str:
+    result = request("load", message=(arg or "").strip())
+    return format_user_message(result)
+
+
+def cmd_aiweb_reset(arg: str = "") -> str:
+    result = request("reset_memory")
+    return format_user_message(result)
+
+
+def cmd_aiweb_summary(arg: str = "") -> str:
+    result = request("summary", message=(arg or "").strip())
+    return format_user_message(result)
+
+
 COMMAND_HANDLERS = {
     "aiweb": cmd_aiweb,
     "aiweb-chat": cmd_aiweb_chat,
@@ -108,6 +130,10 @@ COMMAND_HANDLERS = {
     "aiweb-status": cmd_aiweb_status,
     "aiweb-clear-model": cmd_aiweb_clear_model,
     "aiweb-keep-model": cmd_aiweb_keep_model,
+    "aiweb-run": cmd_aiweb_run,
+    "aiweb-load": cmd_aiweb_load,
+    "aiweb-reset": cmd_aiweb_reset,
+    "aiweb-summary": cmd_aiweb_summary,
 }
 
 
@@ -133,4 +159,8 @@ __all__ = [
     "cmd_aiweb_status",
     "cmd_aiweb_clear_model",
     "cmd_aiweb_keep_model",
+    "cmd_aiweb_run",
+    "cmd_aiweb_load",
+    "cmd_aiweb_reset",
+    "cmd_aiweb_summary",
 ]

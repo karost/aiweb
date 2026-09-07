@@ -1,21 +1,19 @@
 # AI Web — Hermes plugin metadata
-# Architecture v2: session daemon + client, TUI-safe keep-alive,
-# final-only inject, smart size pipeline.
+# Architecture v2.3: session daemon + client, TUI-safe keep-alive,
+# V1 capture (fill + network sniff), final-only inject, safe /aiweb-write.
 
 name: aiweb
-version: "2.0.0"
+version: "2.3.0"
 description: >
-  Grok via real Chrome (Playwright/CDP) with a session daemon for
+  Grok via real Chrome (Playwright/CDP) owned by a session daemon for
   hermes --tui and CLI. Keep-alive browser, large-answer disk+chunk,
   final-only model inject, and safe /aiweb-write.
 
-# Optional metadata (Hermes may ignore unknown keys)
 author: local
 protocol_version: 1
 
 entry: __init__.py
 
-# Env knobs (documented; read by client/daemon/service)
 config:
   RESPONSE_DEFAULT_SIZE:
     env: HERMES_AIWEB_RESPONSE_DEFAULT_SIZE
@@ -36,13 +34,13 @@ config:
     default: 1800
   OUT_DIR:
     env: HERMES_AIWEB_OUT_DIR
-    default: ""   # empty → $HERMES_HOME/data/aiweb/out
+    default: ""
   KEEP_ALIVE:
     env: HERMES_AIWEB_KEEP_ALIVE
     default: "1"
   WRITE_INJECT:
     env: HERMES_AIWEB_WRITE_INJECT
-    default: "none"   # none | path_only
+    default: "none"
   KEEP_ALIVE_BROWSER:
     env: HERMES_AIWEB_KEEP_ALIVE
     default: "1"
@@ -57,7 +55,7 @@ commands:
   - name: aiweb-more
     description: Next chunk of last large response
   - name: aiweb-login
-    description: Headed login / refresh session
+    description: Headed login / refresh session (browser stays up)
   - name: aiweb-stop
     description: Close browser session (optional --daemon)
   - name: aiweb-status
@@ -66,8 +64,16 @@ commands:
     description: Clear inject buffer and sticky flag
   - name: aiweb-keep-model
     description: Make inject sticky until clear (still capped)
+  - name: aiweb-run
+    description: Ask Grok for runnable Python (no local exec in 2.3.0)
+  - name: aiweb-load
+    description: Send hot memory into current Grok tab
+  - name: aiweb-reset
+    description: Reset hot/archive memory and inject buffer
+  - name: aiweb-summary
+    description: Append a short memory summary
 
 notes:
   - Browser is owned by the AI Web daemon, not the TUI slash worker.
   - Inject applies on the next agent LLM call (pre_llm_call), not inside slash.
-  - Automating Grok/x.com may violate ToS — personal use at your own risk.
+  - Automating Grok/x.com may violate ToS — personal use at your own risk.e

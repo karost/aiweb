@@ -24,8 +24,8 @@ class SessionState(str, Enum):
     NEEDS_LOGIN = "NeedsLogin"
 
 
-HEAVY_OPS = frozenset({"aiweb", "chat", "write", "login"})
-CONTROL_OPS = frozenset({"status", "more", "clear_model", "keep_model", "hello"})
+HEAVY_OPS = frozenset({"aiweb", "chat", "write", "login", "run", "load"})
+CONTROL_OPS = frozenset({"status", "more", "clear_model", "keep_model", "hello", "reset_memory", "summary"})
 STOP_OPS = frozenset({"stop"})
 
 

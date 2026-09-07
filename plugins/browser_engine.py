@@ -1,4 +1,8 @@
-"""AI Web — Playwright browser engine (daemon-only) with step debug logs."""
+"""AI Web — Playwright engine (daemon-only).
+
+V1 capture (network sniff, fill, decide_completion) + V2 keep-alive adapters.
+Prefers restored Grok tab over about:blank pages[0].
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,65 @@ from . import memory_manager as mem
 from .artifacts import append_debug_log, capture_page_artifacts
 
 DEFAULT_GROK_URL = os.environ.get("HERMES_AIWEB_GROK_URL", "https://x.com/i/grok")
+GROK_URL = DEFAULT_GROK_URL
+
+
+def _profile_dir() -> Path:
+    env = (os.environ.get("HERMES_AIWEB_PROFILE") or "").strip()
+    if env:
+        d = Path(env).expanduser()
+    else:
+        d = mem.data_dir() / "browser_profile"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+PROFILE_DIR = _profile_dir()
+
+
+def _timeout_sec() -> float:
+    try:
+        return max(30.0, float(os.environ.get("HERMES_AIWEB_TIMEOUT", "300")))
+    except ValueError:
+        return 300.0
+
+
+def _headed_default() -> bool:
+    return os.environ.get("HERMES_AIWEB_HEADED", "0") in ("1", "true", "yes")
+
+
+def decide_completion(
+    *,
+    network_done: bool,
+    ui_complete: bool,
+    started: bool,
+    text_len: int,
+    html_len: int,
+    child_count: int,
+    last_text_len: int,
+    last_html_len: int,
+    last_child_count: int,
+    stable_ms: float,
+    stall_ms: float = 2500.0,
+    min_chars: int = 20,
+) -> tuple[bool, bool, float, int, int, int]:
+    grew = (
+        text_len > last_text_len
+        or html_len > last_html_len
+        or child_count > last_child_count
+    )
+    if grew:
+        started = True
+        stable_ms = 0.0
+
+    if network_done:
+        return True, started, stable_ms, text_len, html_len, child_count
+    if ui_complete and started and text_len >= min_chars:
+        return True, started, stable_ms, text_len, html_len, child_count
+    if started and text_len >= min_chars and stable_ms >= stall_ms and not grew:
+        return True, started, stable_ms, text_len, html_len, child_count
+
+    return False, started, stable_ms, text_len, html_len, child_count
 
 
 @dataclass
@@ -26,30 +89,17 @@ class CaptureResult:
     artifacts: list = field(default_factory=list)
 
 
-def _profile_dir() -> Path:
-    d = mem.data_dir() / "browser_profile"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _timeout_ms() -> int:
-    try:
-        sec = float(os.environ.get("HERMES_AIWEB_TIMEOUT", "300"))
-    except ValueError:
-        sec = 300.0
-    return int(max(30.0, sec) * 1000)
-
-
-def _headed() -> bool:
-    return os.environ.get("HERMES_AIWEB_HEADED", "0") in ("1", "true", "yes")
-
-
 class BrowserEngine:
-    def __init__(self) -> None:
+    """Persistent Playwright context. start() once; stop() only on explicit stop."""
+
+    def __init__(self, headless: Optional[bool] = None) -> None:
+        self.headless = True if headless is None else headless
         self._playwright = None
         self._context = None
         self._page = None
         self._up = False
+        self._last_network_text: Optional[str] = None
+        self._network_done = False
 
     def is_up(self) -> bool:
         return bool(self._up and self._page is not None)
@@ -57,6 +107,41 @@ class BrowserEngine:
     @property
     def page(self):
         return self._page
+
+    def current_url(self) -> str:
+        try:
+            return self._page.url if self._page else ""
+        except Exception:
+            return ""
+
+    def _tab_urls(self) -> list[str]:
+        if self._context is None:
+            return []
+        urls: list[str] = []
+        for p in self._context.pages:
+            try:
+                urls.append(p.url or "")
+            except Exception:
+                urls.append("?")
+        return urls
+
+    def _pick_grok_page(self):
+        if self._context is None:
+            return None
+        for p in self._context.pages:
+            try:
+                if "grok" in (p.url or "").lower():
+                    return p
+            except Exception:
+                continue
+        return None
+
+    def _bind_page(self, page) -> None:
+        self._page = page
+        try:
+            self._page.on("response", self._on_response_complete)
+        except Exception:
+            pass
 
     def _dbg(self, request_id: str, msg: str, steps: list[str]) -> None:
         line = f"{time.strftime('%H:%M:%S')} {msg}"
@@ -69,7 +154,14 @@ class BrowserEngine:
 
     async def start(self, *, headed: Optional[bool] = None) -> None:
         if self.is_up():
-            return
+            if headed is True and self.headless:
+                await self.stop()
+            else:
+                picked = self._pick_grok_page()
+                if picked is not None and picked is not self._page:
+                    self._bind_page(picked)
+                return
+
         try:
             from playwright.async_api import async_playwright
         except ImportError as e:
@@ -78,19 +170,31 @@ class BrowserEngine:
                 "pip install playwright && playwright install chromium"
             ) from e
 
-        headed = _headed() if headed is None else headed
+        use_headed = _headed_default() if headed is None else headed
+        self.headless = not use_headed
+        self._network_done = False
+        self._last_network_text = None
         self._playwright = await async_playwright().start()
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(_profile_dir()),
-            headless=not headed,
-            viewport={"width": 1400, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
+            headless=self.headless,
+            viewport={"width": 1280, "height": 900},
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            ignore_default_args=["--enable-automation"],
         )
-        if self._context.pages:
-            self._page = self._context.pages[0]
+        picked = self._pick_grok_page()
+        if picked is not None:
+            self._bind_page(picked)
+        elif self._context.pages:
+            self._bind_page(self._context.pages[0])
         else:
-            self._page = await self._context.new_page()
+            self._bind_page(await self._context.new_page())
         self._up = True
+        await self.ensure_on_grok(force=False)
 
     async def stop(self) -> None:
         self._up = False
@@ -107,46 +211,89 @@ class BrowserEngine:
         self._context = None
         self._page = None
         self._playwright = None
+        self._last_network_text = None
+        self._network_done = False
 
-    async def ensure_on_grok(self) -> None:
+    async def ensure_on_grok(self, *, force: bool = False) -> None:
         await self.start()
+        picked = self._pick_grok_page()
+        if picked is not None:
+            self._bind_page(picked)
         assert self._page is not None
-        url = self._page.url or ""
-        if "grok" not in url.lower():
-            await self._page.goto(DEFAULT_GROK_URL, wait_until="domcontentloaded")
-            await asyncio.sleep(1.5)
+        url = (self._page.url or "").lower()
+        if not force and "grok" in url:
+            try:
+                await self._find_input()
+            except Exception:
+                # Already on Grok. Do not reload (triggers JSD).
+                return
+            return
+        await self._page.goto(DEFAULT_GROK_URL, wait_until="domcontentloaded", timeout=90_000)
+        await asyncio.sleep(1.5)
 
     async def detect_login_wall(self) -> bool:
-        assert self._page is not None
+        return await self.is_login_required()
+
+    async def is_login_required(self) -> bool:
+        if not self._page:
+            return True
         try:
-            content = (await self._page.content()).lower()
+            content = (await self._page.locator("body").inner_text()).lower()
         except Exception:
             return False
         url = (self._page.url or "").lower()
-        if "login" in url or "flow/login" in url:
+        if "flow/login" in url or url.rstrip("/").endswith("/login"):
             return True
-        markers = ("sign in to x", "log in to x", "/i/flow/login")
-        hits = sum(1 for m in markers if m in content)
-        return hits >= 1 and "grok" not in content[:3000]
+        signals = (
+            "sign in to x",
+            "log in to x",
+            "continue with x",
+            "continue with twitter",
+            "sign in to continue",
+            "sign up to continue",
+        )
+        hits = sum(1 for s in signals if s in content)
+        if hits >= 1:
+            try:
+                await self._find_input()
+                return False
+            except Exception:
+                return True
+        return False
+
+    async def wait_until_logged_in(self, timeout_sec: int = 600) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            try:
+                if not await self.is_login_required():
+                    try:
+                        await self._find_input()
+                        await asyncio.sleep(1.0)
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+        return False
 
     async def login_interactive(self, *, timeout_sec: float = 300.0) -> CaptureResult:
         steps: list[str] = []
         rid = "login"
         try:
-            self._dbg(rid, "login_interactive start headed=True", steps)
+            self._dbg(rid, "login_interactive headed=True (keep-alive)", steps)
             await self.start(headed=True)
-            await self.ensure_on_grok()
-            self._dbg(rid, f"url={self._page.url if self._page else ''}", steps)
-            deadline = time.time() + timeout_sec
-            while time.time() < deadline:
-                if not await self.detect_login_wall():
-                    self._dbg(rid, "login wall cleared", steps)
-                    return CaptureResult(
-                        ok=True,
-                        page_url=self._page.url if self._page else "",
-                        text="login_ok",
-                    )
-                await asyncio.sleep(2.0)
+            await self.ensure_on_grok(force=False)
+            self._dbg(rid, f"url={self.current_url()} tabs={self._tab_urls()}", steps)
+            if not await self.is_login_required():
+                try:
+                    await self._find_input()
+                    return CaptureResult(ok=True, page_url=self.current_url(), text="login_ok")
+                except Exception:
+                    pass
+            ok = await self.wait_until_logged_in(timeout_sec=int(timeout_sec))
+            if ok:
+                return CaptureResult(ok=True, page_url=self.current_url(), text="login_ok")
             arts = await self._artifacts("login", rid, "login wall still present", steps)
             return CaptureResult(
                 ok=False,
@@ -154,75 +301,131 @@ class BrowserEngine:
                 error="login timeout",
                 error_code="needs_login",
                 artifacts=arts,
-                page_url=self._page.url if self._page else "",
+                page_url=self.current_url(),
             )
         except Exception as e:  # noqa: BLE001
             self._dbg(rid, f"login exception {e!r}", steps)
-            return CaptureResult(
-                ok=False,
-                error=str(e),
-                error_code="browser_dead",
-                artifacts=[],
-            )
+            return CaptureResult(ok=False, error=str(e), error_code="browser_dead", artifacts=[])
 
-    async def _probe_inputs(self, page, steps: list[str], request_id: str) -> None:
-        """Record what Playwright can see — for root-cause files."""
-        probes = [
-            'div[contenteditable="true"]',
-            '[contenteditable="true"]',
-            '[role="textbox"]',
-            "textarea",
-            '[data-testid="grok-input"]',
-            '[data-testid*="grok" i]',
-            '[data-testid*="tweet" i]',
-            '[data-testid*="dmComposer" i]',
-            'div[role="textbox"]',
-        ]
-        lines = ["PROBE_INPUTS"]
-        for sel in probes:
+    async def _on_response(self, response) -> None:
+        try:
+            url = response.url.lower()
+            if response.status != 200:
+                return
+            if not any(
+                k in url
+                for k in ("grok", "conversation", "chat", "response", "completions", "stream")
+            ):
+                return
+            ctype = response.headers.get("content-type", "")
+            if "application/json" not in ctype and "text/event-stream" not in ctype:
+                return
             try:
-                loc = page.locator(sel)
-                n = await loc.count()
-                vis = 0
-                for i in range(min(n, 10)):
+                data = await response.json()
+            except Exception:
+                return
+            text = None
+            if isinstance(data, dict):
+                for key in ("response", "message", "content", "text", "output"):
+                    if key in data and isinstance(data[key], str) and len(data[key]) > 20:
+                        text = data[key]
+                        break
+                if not text and "choices" in data and isinstance(data["choices"], list):
                     try:
-                        if await loc.nth(i).is_visible():
-                            vis += 1
+                        text = data["choices"][0]["message"]["content"]
                     except Exception:
                         pass
-                lines.append(f"  sel={sel!r} count={n} visible~={vis}")
-            except Exception as e:  # noqa: BLE001
-                lines.append(f"  sel={sel!r} ERROR {e!r}")
-        block = "\n".join(lines)
-        self._dbg(request_id, block.replace("\n", " | "), steps)
-        steps.append(block)
+            if text and len(text.strip()) > 20:
+                self._last_network_text = text.strip()
+        except Exception:
+            pass
 
-    async def _find_composer(self, page, steps: list[str], request_id: str):
+    async def _on_response_complete(self, response) -> None:
+        try:
+            await self._on_response(response)
+            url = response.url.lower()
+            if response.status != 200:
+                return
+            if not any(
+                k in url
+                for k in (
+                    "grok",
+                    "conversation",
+                    "chat",
+                    "stream",
+                    "responses",
+                    "graphql",
+                    "completions",
+                )
+            ):
+                return
+            try:
+                await response.finished()
+                self._network_done = True
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _find_input(self):
+        assert self._page is not None
         selectors = [
-            '[data-testid="grok-input"]',
-            'div[contenteditable="true"]',
-            '[role="textbox"]',
+            "textarea[placeholder*='Ask']",
+            "textarea[placeholder*='ask']",
+            "textarea[placeholder*='Message']",
+            "textarea[placeholder*='message']",
+            "textarea[placeholder*='Grok']",
+            "textarea[placeholder*='What']",
+            "[data-testid*='grok-input']",
+            "[data-testid*='chat-input']",
+            "[data-testid*='message-input']",
+            "[role='textbox']",
+            "[aria-label*='Ask']",
+            "[aria-label*='Message']",
+            "div[role='textbox'][contenteditable='true']",
+            ".tiptap.ProseMirror[contenteditable='true']",
+            ".ProseMirror[contenteditable='true']",
+            "[contenteditable='true']",
             "textarea",
-            'div[role="textbox"]',
         ]
         for sel in selectors:
-            loc = page.locator(sel)
             try:
+                loc = self._page.locator(sel)
                 n = await loc.count()
+                for i in range(n):
+                    item = loc.nth(i)
+                    try:
+                        if await item.is_visible(timeout=400):
+                            return item
+                    except Exception:
+                        continue
             except Exception:
-                n = 0
-            self._dbg(request_id, f"try sel={sel!r} count={n}", steps)
-            if n == 0:
                 continue
-            for i in range(n - 1, -1, -1):
-                cand = loc.nth(i)
-                try:
-                    if await cand.is_visible():
-                        self._dbg(request_id, f"chosen sel={sel!r} index={i}", steps)
-                        return cand, sel, i
-                except Exception as e:  # noqa: BLE001
-                    self._dbg(request_id, f"nth({i}) err {e!r}", steps)
-        return None, None, None
+        raise RuntimeError(
+            "Could not find Grok chat input.\n"
+            f"Log in at {DEFAULT_GROK_URL} in the browser window, then retry."
+        )
+
+    async def send_message(self, message: str, timeout: Optional[int] = None) -> str:
+        if not self._page:
+            raise RuntimeError("Browser not started")
+        timeout = int(timeout if timeout is not None else _timeout_sec())
+        self._last_network_text = None
+        self._network_done = False
+
+        input_box = await self._find_input()
+        await input_box.click()
+        await asyncio.sleep(0.25)
+        await input_box.fill("")
+        await input_box.fill(message)
+        await asyncio.sleep(0.35)
+        await input_box.press("Enter")
+
+        await self._wait_for_response_stable(timeout=timeout)
+        response = await self._extract_last_response()
+        if self._last_network_text and len(self._last_network_text) > len(response or ""):
+            return self._last_network_text
+        return response.strip() if response else ""
 
     async def submit_and_capture(
         self,
@@ -236,11 +439,27 @@ class BrowserEngine:
         try:
             self._dbg(rid, f"submit_and_capture op={op} prompt_len={len(prompt)}", steps)
             await self.start()
-            await self.ensure_on_grok()
-            self._dbg(rid, f"url={self._page.url if self._page else ''}", steps)
+            await self.ensure_on_grok(force=False)
+            self._dbg(
+                rid,
+                f"up={self.is_up()} url={self.current_url()} tabs={self._tab_urls()}",
+                steps,
+            )
+
+            try:
+                await self._find_input()
+            except Exception as e:
+                arts = await self._artifacts(op, rid, "no composer on grok tab", steps)
+                return CaptureResult(
+                    ok=False,
+                    needs_login=False,
+                    error=str(e),
+                    error_code="empty_extract",
+                    artifacts=arts,
+                    page_url=self.current_url(),
+                )
 
             if await self.detect_login_wall():
-                self._dbg(rid, "login wall detected", steps)
                 arts = await self._artifacts(op, rid, "login wall", steps)
                 return CaptureResult(
                     ok=False,
@@ -248,73 +467,11 @@ class BrowserEngine:
                     error="login required",
                     error_code="needs_login",
                     artifacts=arts,
-                    page_url=self._page.url if self._page else "",
+                    page_url=self.current_url(),
                 )
 
-            assert self._page is not None
-            page = self._page
-            await self._probe_inputs(page, steps, rid)
-
-            input_sel, sel_name, idx = await self._find_composer(page, steps, rid)
-            if input_sel is None:
-                self._dbg(rid, "NO_INPUT found", steps)
-                arts = await self._artifacts(op, rid, "input not found", steps)
-                return CaptureResult(
-                    ok=False,
-                    error="could not find Grok input",
-                    error_code="empty_extract",
-                    artifacts=arts,
-                    page_url=page.url,
-                )
-
-            before = await self._response_fingerprint(page)
-            self._dbg(rid, f"before_body_len={len(before)}", steps)
-
-            await input_sel.scroll_into_view_if_needed()
-            await input_sel.click(timeout=15_000)
-            self._dbg(rid, f"clicked composer {sel_name}#{idx}", steps)
-
-            await page.keyboard.press("Control+a")
-            await page.keyboard.press("Backspace")
-            await page.keyboard.type(prompt, delay=20)
-            self._dbg(rid, "typed prompt via keyboard", steps)
-
-            # Verify something landed in the composer
-            try:
-                typed = await input_sel.inner_text()
-            except Exception:
-                try:
-                    typed = await input_sel.input_value()
-                except Exception:
-                    typed = ""
-            self._dbg(rid, f"composer_inner_len={len(typed or '')} preview={typed[:80]!r}", steps)
-
-            sent = False
-            for bsel in (
-                'button[aria-label*="Send" i]',
-                'button[data-testid*="send" i]',
-                'button:has-text("Send")',
-            ):
-                btn = page.locator(bsel).last
-                try:
-                    if await btn.count() > 0 and await btn.is_visible():
-                        await btn.click(timeout=5000)
-                        sent = True
-                        self._dbg(rid, f"clicked send button {bsel}", steps)
-                        break
-                except Exception as e:  # noqa: BLE001
-                    self._dbg(rid, f"send btn {bsel} err {e!r}", steps)
-            if not sent:
-                await page.keyboard.press("Enter")
-                self._dbg(rid, "pressed Enter", steps)
-
-            await asyncio.sleep(2.0)
-            mid = await self._response_fingerprint(page)
-            self._dbg(rid, f"after_send_body_len={len(mid)} delta={len(mid) - len(before)}", steps)
-
-            text = await self._wait_for_response_stable(page, before, rid, steps)
-            self._dbg(rid, f"final_text_len={len(text or '')}", steps)
-
+            text = await self.send_message(prompt, timeout=int(_timeout_sec()))
+            self._dbg(rid, f"captured_len={len(text or '')} net={bool(self._last_network_text)}", steps)
             if not (text or "").strip():
                 arts = await self._artifacts(op, rid, "empty response", steps)
                 return CaptureResult(
@@ -322,26 +479,9 @@ class BrowserEngine:
                     error="empty extract",
                     error_code="empty_extract",
                     artifacts=arts,
-                    page_url=page.url,
+                    page_url=self.current_url(),
                 )
-
-            # If composer never received text, fail closed with evidence
-            if prompt.strip() and typed is not None and len((typed or "").strip()) < 2:
-                self._dbg(rid, "WARN composer still empty after type", steps)
-                arts = await self._artifacts(op, rid, "type did not stick in composer", steps)
-                return CaptureResult(
-                    ok=False,
-                    error="type did not stick in composer",
-                    error_code="empty_extract",
-                    artifacts=arts,
-                    page_url=page.url,
-                )
-
-            return CaptureResult(
-                ok=True,
-                text=self._strip_chrome(text),
-                page_url=page.url,
-            )
+            return CaptureResult(ok=True, text=text.strip(), page_url=self.current_url())
         except Exception as e:  # noqa: BLE001
             self._dbg(rid, f"exception {e!r}", steps)
             err = str(e).lower()
@@ -351,73 +491,144 @@ class BrowserEngine:
                 arts = await self._artifacts(op, rid, repr(e), steps)
             except Exception:
                 pass
-            return CaptureResult(
-                ok=False,
-                error=str(e),
-                error_code=code,
-                artifacts=arts,
-            )
+            return CaptureResult(ok=False, error=str(e), error_code=code, artifacts=arts)
 
-    async def _response_fingerprint(self, page) -> str:
+    async def _ui_turn_complete(self) -> bool:
+        assert self._page is not None
         try:
-            return await page.inner_text("body")
+            stop = self._page.locator(
+                "button:has-text('Stop'), [aria-label*='Stop generating'], [aria-label*='Stop']"
+            )
+            if await stop.count() > 0:
+                try:
+                    if await stop.first.is_visible(timeout=300):
+                        return False
+                except Exception:
+                    pass
+            actions = self._page.locator(
+                "button:has-text('Copy'), [aria-label*='Copy'], [data-testid*='copy']"
+            )
+            if await actions.count() > 0:
+                try:
+                    if await actions.last.is_visible(timeout=300):
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    async def _measure_last_assistant(self) -> tuple[int, int, int]:
+        assert self._page is not None
+        sels = [
+            "[data-testid*='assistant']",
+            "[data-message-author-role='assistant']",
+            ".response-content-markdown",
+            "[class*='assistant']",
+            "[class*='response']",
+        ]
+        for sel in sels:
+            try:
+                loc = self._page.locator(sel).last
+                if await loc.count() == 0:
+                    continue
+                text = (await loc.inner_text()) or ""
+                html = (await loc.inner_html()) or ""
+                children = await loc.evaluate("el => el.children.length")
+                return len(text.strip()), len(html), int(children or 0)
+            except Exception:
+                continue
+        try:
+            body = await self._page.locator("body").inner_text()
+            return len(body or ""), 0, 0
+        except Exception:
+            return 0, 0, 0
+
+    async def _wait_for_response_stable(self, timeout: int = 300) -> None:
+        poll = 0.5
+        stall_ms = 2500.0
+        started = False
+        stable_ms = 0.0
+        last_t = last_h = last_c = 0
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            ui_done = await self._ui_turn_complete()
+            t, h, c = await self._measure_last_assistant()
+            grew = t > last_t or h > last_h or c > last_c
+            if grew:
+                started = True
+                stable_ms = 0.0
+                last_t, last_h, last_c = t, h, c
+            elif started:
+                stable_ms += poll * 1000.0
+            done, started, stable_ms, last_t, last_h, last_c = decide_completion(
+                network_done=self._network_done,
+                ui_complete=ui_done,
+                started=started,
+                text_len=t,
+                html_len=h,
+                child_count=c,
+                last_text_len=last_t,
+                last_html_len=last_h,
+                last_child_count=last_c,
+                stable_ms=stable_ms,
+                stall_ms=stall_ms,
+                min_chars=20,
+            )
+            if done:
+                await asyncio.sleep(0.3)
+                return
+            await asyncio.sleep(poll)
+
+    async def _extract_last_response(self) -> str:
+        assert self._page is not None
+        preferred = [
+            "[data-testid*='response']",
+            "[data-testid*='assistant']",
+            "[data-message-author-role='assistant']",
+            "[data-author='assistant']",
+            ".response-content-markdown",
+            "[class*='assistant']",
+            "[class*='response']",
+            "[class*='message-bubble']",
+            "[class*='Message']",
+        ]
+        for sel in preferred:
+            try:
+                locs = self._page.locator(sel)
+                count = await locs.count()
+                if count > 0:
+                    for i in range(count - 1, -1, -1):
+                        try:
+                            text = await locs.nth(i).inner_text()
+                            clean = (text or "").strip()
+                            if len(clean) > 25:
+                                return clean
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        generic = ["[class*='message']", "[class*='bubble']", "article", "div[role='article']"]
+        for sel in generic:
+            try:
+                locs = self._page.locator(sel)
+                count = await locs.count()
+                if count > 0:
+                    text = await locs.nth(count - 1).inner_text()
+                    clean = (text or "").strip()
+                    if len(clean) > 40:
+                        return clean
+            except Exception:
+                continue
+        if self._last_network_text:
+            return self._last_network_text
+        try:
+            body = await self._page.locator("body").inner_text()
+            return body[-4500:].strip()
         except Exception:
             return ""
 
-    async def _wait_for_response_stable(
-        self, page, before: str, request_id: str, steps: list[str]
-    ) -> str:
-        timeout_ms = _timeout_ms()
-        deadline = time.time() + timeout_ms / 1000.0
-        last = before
-        stable_hits = 0
-        min_growth = 80
-        self._dbg(request_id, f"wait stable timeout_ms={timeout_ms}", steps)
-
-        while time.time() < deadline:
-            await asyncio.sleep(1.0)
-            try:
-                now = await page.inner_text("body")
-            except Exception:
-                continue
-            grown = len(now) >= len(before) + min_growth and now != before
-            if grown:
-                if now == last:
-                    stable_hits += 1
-                    if stable_hits >= 4:
-                        self._dbg(request_id, f"stable hit len={len(now)}", steps)
-                        return now
-                else:
-                    stable_hits = 0
-                    last = now
-            else:
-                stable_hits = 0
-                last = now
-
-        self._dbg(request_id, "wait stable TIMEOUT returning best effort", steps)
-        try:
-            return await page.inner_text("body")
-        except Exception:
-            return last or ""
-
-    def _strip_chrome(self, text: str) -> str:
-        lines = []
-        for ln in (text or "").splitlines():
-            s = ln.strip()
-            low = s.lower()
-            if not s:
-                lines.append(ln)
-                continue
-            if low in ("home", "explore", "notifications", "messages", "grok"):
-                continue
-            if low.startswith("cookie") or low == "sign in":
-                continue
-            lines.append(ln)
-        return "\n".join(lines).strip()
-
-    async def _artifacts(
-        self, op: str, request_id: str, note: str, steps: list[str]
-    ) -> list:
+    async def _artifacts(self, op: str, request_id: str, note: str, steps: list[str]) -> list:
         if self._page is None:
             return []
         return await capture_page_artifacts(
@@ -427,12 +638,6 @@ class BrowserEngine:
             note=note,
             extra_text="\n".join(steps),
         )
-
-    def current_url(self) -> str:
-        try:
-            return self._page.url if self._page else ""
-        except Exception:
-            return ""
 
 
 def run_async(coro):
@@ -453,5 +658,8 @@ __all__ = [
     "BrowserEngine",
     "CaptureResult",
     "DEFAULT_GROK_URL",
+    "GROK_URL",
+    "PROFILE_DIR",
+    "decide_completion",
     "run_async",
 ]
